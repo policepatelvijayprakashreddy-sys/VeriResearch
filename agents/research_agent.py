@@ -1,0 +1,328 @@
+from search.search_manager import search
+from llm_client import create_llm, safe_invoke
+from config import (
+    RESEARCH_INITIAL_MAX_RESULTS,
+    RESEARCH_FOLLOWUP_MAX_RESULTS,
+)
+
+
+def summarize_research(
+    llm,
+    topic,
+    results,
+    previous_summary=""
+):
+    """Create or update the research summary."""
+
+    if not results:
+        return previous_summary
+
+    context = "\n\n".join(
+        f"TITLE: {r.get('title', '')}\n"
+        f"URL: {r.get('url', '')}\n"
+        f"CONTENT: {r.get('content', '')}"
+        for r in results
+    )
+
+    prompt = f"""
+You are a research assistant.
+
+Research topic:
+{topic}
+
+Previous research summary:
+{previous_summary}
+
+New web research:
+{context}
+
+Create an accurate updated research summary.
+
+Rules:
+
+- Use only information supported by the provided research.
+- Do not invent facts.
+- Do not invent sources.
+- Do not invent statistics.
+- Do not invent authors or publication dates.
+- If information is uncertain, say so.
+- Incorporate useful new information into the previous summary.
+- Avoid unnecessary repetition.
+
+Return only the research summary.
+"""
+
+    return safe_invoke(
+        llm,
+        prompt,
+        default=previous_summary
+    )
+
+
+def find_knowledge_gap(
+    llm,
+    topic,
+    summary
+):
+    """Identify one important missing research area."""
+
+    prompt = f"""
+You are a critical research assistant.
+
+Research topic:
+{topic}
+
+Current research summary:
+{summary}
+
+Identify ONE important knowledge gap.
+
+Then create ONE search query that would specifically
+help investigate that gap.
+
+The query should be different from a generic search
+for the research topic.
+
+Return exactly:
+
+GAP: <specific missing information>
+QUERY: <specific follow-up search query>
+"""
+
+    text = safe_invoke(
+        llm,
+        prompt,
+        default=""
+    )
+
+    gap = ""
+    query = ""
+
+    for line in text.splitlines():
+
+        if line.startswith("GAP:"):
+            gap = line.replace(
+                "GAP:",
+                "",
+                1
+            ).strip()
+
+        elif line.startswith("QUERY:"):
+            query = line.replace(
+                "QUERY:",
+                "",
+                1
+            ).strip()
+
+    return gap, query
+
+
+def generate_initial_query(
+    llm,
+    topic
+):
+    """Generate the initial research query."""
+
+    prompt = f"""
+Create ONE high-quality web search query
+for the following research topic:
+
+{topic}
+
+The query should focus on finding useful,
+reliable information about the topic.
+
+Return ONLY the search query.
+"""
+
+    # Fall back to the raw topic itself if the LLM call fails,
+    # so a downed Ollama instance doesn't kill the search step.
+    return safe_invoke(
+        llm,
+        prompt,
+        default=topic
+    )
+
+
+def merge_sources(
+    previous_sources,
+    new_sources
+):
+    """Merge sources and remove duplicate URLs."""
+
+    combined = []
+
+    seen_urls = set()
+
+    for source in (
+        previous_sources + new_sources
+    ):
+
+        url = source.get(
+            "url",
+            ""
+        ).strip().lower()
+
+        if not url:
+            continue
+
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+
+        combined.append(source)
+
+    return combined
+
+
+def research_agent(
+    topic,
+    previous_research=""
+):
+    """
+    Perform web research and return both the
+    summary and the actual sources.
+    """
+
+    llm = create_llm()
+
+    # =========================================
+    # INITIAL QUERY
+    # =========================================
+
+    query = generate_initial_query(
+        llm,
+        topic
+    )
+
+    print("\n[Research Search]")
+    print(
+        f"Search query: {query}"
+    )
+
+    # =========================================
+    # ROUND 1 SEARCH
+    # =========================================
+
+    results = search(
+        query,
+        max_results=RESEARCH_INITIAL_MAX_RESULTS
+    )
+
+    print(
+        f"Found {len(results)} sources."
+    )
+
+    # =========================================
+    # SEARCH FAILURE
+    # =========================================
+
+    if not results:
+
+        print(
+            "Web search failed. "
+            "Keeping previous research."
+        )
+
+        return {
+            "summary": previous_research,
+            "sources": [],
+            "new_sources_found": False,
+            "knowledge_gap": "",
+            "follow_up_query": ""
+        }
+
+    # =========================================
+    # UPDATE SUMMARY
+    # =========================================
+
+    summary = summarize_research(
+        llm,
+        topic,
+        results,
+        previous_summary=previous_research
+    )
+
+    # =========================================
+    # REFLECTION
+    # =========================================
+
+    print("\n[Reflection]")
+
+    gap, follow_up_query = find_knowledge_gap(
+        llm,
+        topic,
+        summary
+    )
+
+    print(
+        f"Knowledge gap: {gap}"
+    )
+
+    print(
+        f"Follow-up query: {follow_up_query}"
+    )
+
+    # =========================================
+    # FOLLOW-UP SEARCH
+    # =========================================
+
+    follow_up_results = []
+
+    if follow_up_query:
+
+        print(
+            "\n[Research Follow-up]"
+        )
+
+        follow_up_results = search(
+            follow_up_query,
+            max_results=RESEARCH_FOLLOWUP_MAX_RESULTS
+        )
+
+        print(
+            f"Found {len(follow_up_results)} "
+            f"additional sources."
+        )
+
+        if follow_up_results:
+
+            summary = summarize_research(
+                llm,
+                topic,
+                follow_up_results,
+                previous_summary=summary
+            )
+
+    # =========================================
+    # COMBINE SOURCES
+    # =========================================
+
+    all_new_sources = (
+        results
+        + follow_up_results
+    )
+
+    unique_sources = merge_sources(
+        [],
+        all_new_sources
+    )
+
+    # =========================================
+    # RETURN STRUCTURED RESULT
+    # =========================================
+
+    return {
+        "summary": summary,
+
+        "sources": unique_sources,
+
+        "new_sources_found": bool(
+            unique_sources
+        ),
+
+        "knowledge_gap": gap,
+
+        "follow_up_query": follow_up_query
+    }
