@@ -1,0 +1,22 @@
+[
+  {
+    "topic": "CRISPR gene editing in human embryos",
+    "type": "technical"
+  },
+  {
+    "topic": "efficacy of homeopathy in oncology",
+    "type": "controversial"
+  },
+  {
+    "topic": "economic impact of 14th century Martian trade routes",
+    "type": "zero_data"
+  },
+  {
+    "topic": "latest advances in mRNA vaccine delivery",
+    "type": "recency"
+  },
+  {
+    "topic": "topological quantum field theory in condensed matter physics",
+    "type": "jargon"
+  }
+]

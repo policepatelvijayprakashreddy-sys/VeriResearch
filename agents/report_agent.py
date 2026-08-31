@@ -8,7 +8,8 @@ def report_agent(
     literature_analysis,
     literature_sources,
     critic_result,
-    evidence
+    evidence,
+    verification_results=None,
 ):
     """Generate the final research report with verified source lists."""
 
@@ -86,6 +87,33 @@ def report_agent(
         )
 
     # =========================================
+    # UNVERIFIED CLAIMS (Verification Node)
+    # =========================================
+    
+    unverified_section = ""
+    if verification_results:
+        from agents.verification_agent import get_unverified_claims, CONTRADICTION
+        unverified_claims = get_unverified_claims({"results": verification_results})
+        
+        if unverified_claims:
+            unverified_section = "\n\n### Claims We Could Not Verify\n\n"
+            unverified_section += "The following claims were extracted from sources but our NLI verification model could not confirm that the source text directly entails them. These should be treated with additional scrutiny:\n\n"
+            
+            for uc in unverified_claims:
+                icon = "❌" if uc["label"] == CONTRADICTION else "⚠️"
+                conf = f" (confidence: {uc['confidence']})" if uc['confidence'] else ""
+                
+                # Try to link it to the citation number if possible
+                cit_num = ""
+                for k, v in citation_numbers.items():
+                    if uc["source_url"] == v:
+                        cit_num = f"[{k}] "
+                        break
+                        
+                unverified_section += f"- {icon} \"{uc['claim']}\"\n"
+                unverified_section += f"  Source: {cit_num}[{uc['source_title']}]({uc['source_url']}) | Status: {uc['label']}{conf}\n\n"
+
+    # =========================================
     # REPORT PROMPT
     # =========================================
 
@@ -107,6 +135,15 @@ LITERATURE ANALYSIS
 
 {literature_analysis}
 
+---
+
+## Unverified Claims Data
+If there are unverified claims, include them exactly as provided below inside your "5. Knowledge Gaps" section. Do not alter them.
+{unverified_section}
+
+---
+
+## 4. INSTRUCTIONS
 ========================================
 CRITIC REPORT
 ========================================
@@ -282,7 +319,7 @@ Return ONLY Sections 1 through 7.
 """
 
     # =========================================
-    # GENERATE REPORT BODY
+    # WRITE REPORT VIA LLM
     # =========================================
 
     fallback_body = (

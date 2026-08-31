@@ -1,3 +1,4 @@
+import logging
 from typing import TypedDict, Any
 
 from langgraph.graph import StateGraph, START, END
@@ -7,12 +8,19 @@ from agents.literature_agent import literature_agent
 from agents.evidence_agent import extract_evidence
 from agents.critic_agent import critic_agent
 from agents.report_agent import report_agent
+from agents.recommendation_agent import (
+    recommendation_agent,
+    format_recommendations_md,
+)
+from agents.verification_agent import verification_agent
 
 from config import (
     MAX_WEB_SOURCES,
     MAX_ACADEMIC_SOURCES,
     MAX_RESEARCH_ROUNDS,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -35,6 +43,8 @@ class ResearchState(TypedDict, total=False):
 
     # Extracted evidence
     evidence: list
+    verification_results: list
+    hallucination_rate: float
 
     # Critic
     critique: Any
@@ -48,6 +58,9 @@ class ResearchState(TypedDict, total=False):
     # Final output
     final_report: str
 
+    # Recommendations
+    recommendations: list
+
 
 # ============================================================
 # RESEARCH NODE
@@ -59,9 +72,9 @@ def research_node(state: ResearchState):
         state.get("research_round", 0) + 1
     )
 
-    print(
-        f"\n>>> Running Research Agent "
-        f"(Graph Round {current_round})..."
+    logger.info(
+        "Running Research Agent (Graph Round %d)...",
+        current_round
     )
 
     # --------------------------------------------------------
@@ -192,14 +205,12 @@ def research_node(state: ResearchState):
     # Display information
     # --------------------------------------------------------
 
-    print(
-        f"Total web sources kept: "
-        f"{len(unique_sources)}"
+    logger.info(
+        "Total web sources kept: %d", len(unique_sources)
     )
 
-    print(
-        f"New web sources found: "
-        f"{new_sources_found}"
+    logger.info(
+        "New web sources found: %s", new_sources_found
     )
 
     # --------------------------------------------------------
@@ -228,9 +239,7 @@ def research_node(state: ResearchState):
 
 def literature_node(state: ResearchState):
 
-    print(
-        "\n>>> Running Literature Agent..."
-    )
+    logger.info("Running Literature Agent...")
 
     # --------------------------------------------------------
     # Previous literature
@@ -332,14 +341,12 @@ def literature_node(state: ResearchState):
     # Display information
     # --------------------------------------------------------
 
-    print(
-        f"Found {len(new_sources)} "
-        f"new academic sources."
+    logger.info(
+        "Found %d new academic sources.", len(new_sources)
     )
 
-    print(
-        f"Total academic sources kept: "
-        f"{len(unique_sources)}"
+    logger.info(
+        "Total academic sources kept: %d", len(unique_sources)
     )
 
     # --------------------------------------------------------
@@ -367,9 +374,7 @@ def literature_node(state: ResearchState):
 
 def evidence_node(state: ResearchState):
 
-    print(
-        "\n>>> Running Evidence Agent..."
-    )
+    logger.info("Running Evidence Agent...")
 
     topic = state["topic"]
 
@@ -406,17 +411,13 @@ def evidence_node(state: ResearchState):
         if source.get("url", "").strip()
     }
 
-    print(
-        f"[Evidence Node] "
-        f"Processing {len(all_sources)} sources."
+    logger.info(
+        "[Evidence Node] Processing %d sources.", len(all_sources)
     )
 
     if not all_sources:
 
-        print(
-            "[Evidence Node] "
-            "No sources available."
-        )
+        logger.info("[Evidence Node] No sources available.")
 
         return {
             "evidence": []
@@ -467,15 +468,44 @@ def evidence_node(state: ResearchState):
             "evidence": []
         }
 
-    print(
-        f"[Evidence Node] "
-        f"Extracted {len(evidence_items)} evidence items."
+    logger.info(
+        "[Evidence Node] Extracted %d evidence items.",
+        len(evidence_items)
     )
 
     return {
         "evidence": evidence_items
     }
 
+# ============================================================
+# VERIFICATION NODE
+# ============================================================
+
+def verification_node(state: ResearchState):
+    logger.info("Running Verification Agent...")
+    
+    evidence_items = state.get("evidence", [])
+    
+    if not evidence_items:
+        return {
+            "verification_results": [],
+            "hallucination_rate": None
+        }
+        
+    try:
+        summary = verification_agent(evidence_items)
+        
+        return {
+            "verification_results": summary.get("results", []),
+            "hallucination_rate": summary.get("hallucination_rate")
+        }
+        
+    except Exception as error:
+        logger.error("[Verification Node] Failed: %s", error)
+        return {
+            "verification_results": [],
+            "hallucination_rate": None
+        }
 
 # ============================================================
 # CRITIC NODE
@@ -483,9 +513,7 @@ def evidence_node(state: ResearchState):
 
 def critic_node(state: ResearchState):
 
-    print(
-        "\n>>> Running Critic Agent..."
-    )
+    logger.info("Running Critic Agent...")
 
     literature = state.get(
         "literature",
@@ -555,17 +583,12 @@ def critic_node(state: ResearchState):
         "SUFFICIENT"
     }:
 
-        print(
-            "\n[Critic Warning] "
-            "No valid decision was returned."
-        )
+        logger.warning("[Critic Warning] No valid decision was returned.")
 
         # Conservative stopping fallback
         decision = "SUFFICIENT"
 
-    print(
-        f"\n[Critic Decision] {decision}"
-    )
+    logger.info("[Critic Decision] %s", decision)
 
     return {
         "critique": result,
@@ -611,10 +634,8 @@ def route_after_critic(
         and not new_literature
     ):
 
-        print(
-            "\n[Graph Decision] "
-            "No new information was found. "
-            "Stopping research."
+        logger.info(
+            "[Graph Decision] No new information was found. Stopping research."
         )
 
         return "report"
@@ -632,9 +653,8 @@ def route_after_critic(
         and research_round < MAX_RESEARCH_ROUNDS
     ):
 
-        print(
-            "\n[Graph Decision] "
-            "More useful information may be found."
+        logger.info(
+            "[Graph Decision] More useful information may be found."
         )
 
         return "research"
@@ -645,13 +665,10 @@ def route_after_critic(
 
     if (
         decision == "MORE_RESEARCH"
-        and research_round >= MAX_RESEARCH_ROUNDS
+        and research_round > MAX_RESEARCH_ROUNDS
     ):
 
-        print(
-            "\n[Graph Decision] "
-            "Maximum research rounds reached."
-        )
+        logger.info("[Graph Decision] Maximum research rounds reached.")
 
         return "report"
 
@@ -659,10 +676,7 @@ def route_after_critic(
     # SUFFICIENT
     # ========================================================
 
-    print(
-        "\n[Graph Decision] "
-        "Research is sufficient."
-    )
+    logger.info("[Graph Decision] Research is sufficient.")
 
     return "report"
 
@@ -673,9 +687,7 @@ def route_after_critic(
 
 def report_node(state: ResearchState):
 
-    print(
-        "\n>>> Running Report Agent..."
-    )
+    logger.info("Running Report Agent...")
 
     literature = state.get(
         "literature",
@@ -728,7 +740,12 @@ def report_node(state: ResearchState):
                 ""
             ),
 
-            evidence
+            evidence,
+            
+            state.get(
+                "verification_results",
+                []
+            )
         )
 
     except Exception as error:
@@ -757,108 +774,103 @@ def report_node(state: ResearchState):
 
 
 # ============================================================
+# RECOMMENDATION NODE
+# ============================================================
+
+def recommendation_node(state: ResearchState):
+
+    logger.info("Running Recommendation Agent...")
+
+    topic = state["topic"]
+
+    literature = state.get("literature", {})
+    literature_sources = literature.get("sources", [])
+    literature_analysis = literature.get("analysis", "")
+    
+    web_sources = state.get("web_sources", [])
+    verified_evidence = state.get("verification_results", [])
+
+    try:
+
+        output = recommendation_agent(
+            topic=topic,
+            literature_sources=literature_sources,
+            web_sources=web_sources,
+            literature_analysis=literature_analysis,
+            verified_evidence=verified_evidence,
+        )
+
+        # Serialise to plain dicts for state storage
+        rec_dicts = [
+            rec.model_dump()
+            for rec in output.recommendations
+        ]
+
+        # Append Research Opportunities section to the final report
+        existing_report = state.get("final_report", "")
+
+        rec_section = format_recommendations_md(output, topic)
+
+        updated_report = existing_report + rec_section
+
+        logger.info(
+            "[Recommendation] Appended %d recommendations to report.",
+            len(rec_dicts)
+        )
+
+        return {
+            "recommendations": rec_dicts,
+            "final_report": updated_report,
+        }
+
+    except Exception as error:
+
+        logger.error(
+            "[Recommendation Node] Failed: %s", error
+        )
+
+        return {
+            "recommendations": [],
+        }
+
+
+# ============================================================
 # BUILD LANGGRAPH
 # ============================================================
 
-builder = StateGraph(
-    ResearchState
-)
 
+def _build_graph():
+    """Construct and compile the research LangGraph."""
 
-# ============================================================
-# ADD NODES
-# ============================================================
+    workflow = StateGraph(ResearchState)
 
-builder.add_node(
-    "research",
-    research_node
-)
+    workflow.add_node("research", research_node)
+    workflow.add_node("literature", literature_node)
+    workflow.add_node("evidence", evidence_node)
+    workflow.add_node("verification", verification_node)
+    workflow.add_node("critic", critic_node)
+    workflow.add_node("report", report_node)
+    workflow.add_node("recommendation", recommendation_node)
 
-builder.add_node(
-    "literature",
-    literature_node
-)
+    workflow.add_edge(START, "research")
+    workflow.add_edge("research", "literature")
+    workflow.add_edge("literature", "evidence")
+    workflow.add_edge("evidence", "verification")
+    workflow.add_edge("verification", "critic")
 
-builder.add_node(
-    "evidence",
-    evidence_node
-)
+    workflow.add_conditional_edges(
+        "critic",
+        route_after_critic,
+        {
+            "research": "research",
+            "report": "report"
+        }
+    )
 
-builder.add_node(
-    "critic",
-    critic_node
-)
+    workflow.add_edge("report", "recommendation")
+    workflow.add_edge("recommendation", END)
 
-builder.add_node(
-    "report",
-    report_node
-)
-
-
-# ============================================================
-# START → RESEARCH
-# ============================================================
-
-builder.add_edge(
-    START,
-    "research"
-)
-
-
-# ============================================================
-# RESEARCH → LITERATURE
-# ============================================================
-
-builder.add_edge(
-    "research",
-    "literature"
-)
-
-
-# ============================================================
-# LITERATURE → CRITIC
-# ============================================================
-
-builder.add_edge(
-    "literature",
-    "evidence"
-)
-
-builder.add_edge(
-    "evidence",
-    "critic"
-)
-
-
-# ============================================================
-# CRITIC → CONDITIONAL ROUTING
-# ============================================================
-
-builder.add_conditional_edges(
-    "critic",
-    route_after_critic,
-    {
-        "research": "research",
-        "report": "report"
-    }
-)
-
-
-# ============================================================
-# REPORT → END
-# ============================================================
-
-builder.add_edge(
-    "report",
-    END
-)
-
-
-# ============================================================
-# COMPILE GRAPH
-# ============================================================
-
-research_graph = builder.compile()
+    return workflow.compile()
 
 
 # ============================================================
@@ -867,17 +879,12 @@ research_graph = builder.compile()
 
 def run_research(topic):
 
-    print(
-        "\n=============================="
-    )
+    logger.info("==============================")
+    logger.info("   AI RESEARCH SYSTEM")
+    logger.info("==============================")
 
-    print(
-        "   AI RESEARCH SYSTEM"
-    )
-
-    print(
-        "=============================="
-    )
+    # Build the graph fresh for each run
+    research_graph = _build_graph()
 
     # --------------------------------------------------------
     # Initial Graph State

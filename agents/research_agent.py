@@ -1,9 +1,13 @@
+import logging
+
 from search.search_manager import search
 from llm_client import create_llm, safe_invoke
 from config import (
     RESEARCH_INITIAL_MAX_RESULTS,
     RESEARCH_FOLLOWUP_MAX_RESULTS,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def summarize_research(
@@ -196,10 +200,8 @@ def research_agent(
         topic
     )
 
-    print("\n[Research Search]")
-    print(
-        f"Search query: {query}"
-    )
+    logger.info("[Research Search]")
+    logger.info("Search query: %s", query)
 
     # =========================================
     # ROUND 1 SEARCH
@@ -210,9 +212,7 @@ def research_agent(
         max_results=RESEARCH_INITIAL_MAX_RESULTS
     )
 
-    print(
-        f"Found {len(results)} sources."
-    )
+    logger.info("Found %d sources.", len(results))
 
     # =========================================
     # SEARCH FAILURE
@@ -220,10 +220,7 @@ def research_agent(
 
     if not results:
 
-        print(
-            "Web search failed. "
-            "Keeping previous research."
-        )
+        logger.warning("Web search failed. Keeping previous research.")
 
         return {
             "summary": previous_research,
@@ -248,7 +245,7 @@ def research_agent(
     # REFLECTION
     # =========================================
 
-    print("\n[Reflection]")
+    logger.info("[Reflection]")
 
     gap, follow_up_query = find_knowledge_gap(
         llm,
@@ -256,13 +253,8 @@ def research_agent(
         summary
     )
 
-    print(
-        f"Knowledge gap: {gap}"
-    )
-
-    print(
-        f"Follow-up query: {follow_up_query}"
-    )
+    logger.info("Knowledge gap: %s", gap)
+    logger.info("Follow-up query: %s", follow_up_query)
 
     # =========================================
     # FOLLOW-UP SEARCH
@@ -272,18 +264,15 @@ def research_agent(
 
     if follow_up_query:
 
-        print(
-            "\n[Research Follow-up]"
-        )
+        logger.info("[Research Follow-up]")
 
         follow_up_results = search(
             follow_up_query,
             max_results=RESEARCH_FOLLOWUP_MAX_RESULTS
         )
 
-        print(
-            f"Found {len(follow_up_results)} "
-            f"additional sources."
+        logger.info(
+            "Found %d additional sources.", len(follow_up_results)
         )
 
         if follow_up_results:

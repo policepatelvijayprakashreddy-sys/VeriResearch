@@ -3,3 +3,9 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Auto-generated research reports
+reports/*.md
+
+# Runtime data
+data/

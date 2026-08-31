@@ -1,7 +1,10 @@
+import logging
 import time
 
 import requests
 from ddgs import DDGS
+
+from search.cache import get_cached, set_cached
 
 from config import (
     DEFAULT_MAX_RESULTS,
@@ -10,6 +13,8 @@ from config import (
     SEARXNG_INSTANCES,
     SEARXNG_TIMEOUT_SECONDS,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================
@@ -117,13 +122,8 @@ def _search_once(
 
     results = []
 
-    print(
-        f'\n[Search Manager]'
-    )
-
-    print(
-        f'Searching for: "{query}"'
-    )
+    logger.info("[Search Manager]")
+    logger.info('Searching for: "%s"', query)
 
     try:
 
@@ -148,9 +148,7 @@ def _search_once(
 
     except Exception as error:
 
-        print(
-            f"DDGS search failed: {error}"
-        )
+        logger.warning("DDGS search failed: %s", error)
 
         return []
 
@@ -175,10 +173,7 @@ def _search_searxng(
 
     for instance in SEARXNG_INSTANCES:
 
-        print(
-            f"\n[SearXNG Fallback] "
-            f"Trying instance: {instance}"
-        )
+        logger.info("[SearXNG Fallback] Trying instance: %s", instance)
 
         try:
 
@@ -235,27 +230,23 @@ def _search_searxng(
 
             if results:
 
-                print(
-                    f"[SearXNG Fallback] "
-                    f"{instance} returned "
-                    f"{len(results)} results."
+                logger.info(
+                    "[SearXNG Fallback] %s returned %d results.",
+                    instance, len(results)
                 )
 
                 return results
 
         except Exception as error:
 
-            print(
-                f"[SearXNG Fallback] "
-                f"{instance} failed: {error}"
+            logger.warning(
+                "[SearXNG Fallback] %s failed: %s", instance, error
             )
 
             continue
 
-    print(
-        "[SearXNG Fallback] "
-        "All SearXNG instances failed or "
-        "returned no results."
+    logger.warning(
+        "[SearXNG Fallback] All instances failed or returned no results."
     )
 
     return []
@@ -284,16 +275,19 @@ def search(
         )
 
         return []
+        
+    from config import SEARCH_CACHE_ENABLED
+    if SEARCH_CACHE_ENABLED:
+        cached = get_cached(query, max_results)
+        if cached is not None:
+            return cached
 
     for attempt in range(
         1,
         MAX_SEARCH_RETRIES + 1
     ):
 
-        print(
-            f"\n[Search Attempt "
-            f"{attempt}/{MAX_SEARCH_RETRIES}"
-        )
+        logger.info("[Search Attempt %d/%d]", attempt, MAX_SEARCH_RETRIES)
 
         results = _search_once(
             query,
@@ -302,10 +296,12 @@ def search(
 
         if results:
 
-            print(
-                f"Search Manager found "
-                f"{len(results)} unique sources."
+            logger.info(
+                "Search Manager found %d unique sources.", len(results)
             )
+            
+            if SEARCH_CACHE_ENABLED:
+                set_cached(query, max_results, results)
 
             return results
 
@@ -315,10 +311,7 @@ def search(
 
         if attempt < MAX_SEARCH_RETRIES:
 
-            print(
-                "No results returned. "
-                "Retrying..."
-            )
+            logger.info("No results returned. Retrying...")
 
             time.sleep(
                 SEARCH_RETRY_DELAY_SECONDS
@@ -328,10 +321,8 @@ def search(
     # FALLBACK: SEARXNG
     # ========================================
 
-    print(
-        "\n[Search Manager] "
-        "DDGS exhausted all retries. "
-        "Falling back to SearXNG..."
+    logger.warning(
+        "[Search Manager] DDGS exhausted all retries. Falling back to SearXNG..."
     )
 
     results = _search_searxng(
@@ -341,10 +332,12 @@ def search(
 
     if results:
 
-        print(
-            f"Search Manager found "
-            f"{len(results)} unique sources via SearXNG."
+        logger.info(
+            "Search Manager found %d unique sources via SearXNG.", len(results)
         )
+        
+        if SEARCH_CACHE_ENABLED:
+            set_cached(query, max_results, results)
 
         return results
 
@@ -352,16 +345,8 @@ def search(
     # ALL ATTEMPTS FAILED
     # ========================================
 
-    print(
-        "\n[Search Manager]"
-    )
-
-    print(
-        "All search providers failed (DDGS and SearXNG)."
-    )
-
-    print(
-        f'Query: "{query}"'
+    logger.error(
+        '[Search Manager] All search providers failed. Query: "%s"', query
     )
 
     return []

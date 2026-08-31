@@ -1,0 +1,26 @@
+# VeriResearch — AI Research Agent
+# Install with: pip install -r requirements.txt
+
+# ── LLM & Agent Framework ─────────────────────────────────
+langchain-core>=0.3
+langchain-ollama>=0.3
+langgraph>=0.6
+
+# ── Pydantic (structured outputs) ─────────────────────────
+pydantic>=2.0
+
+# ── Search ────────────────────────────────────────────────
+# DuckDuckGo Search (primary web search provider)
+ddgs>=8.0
+
+# HTTP requests (SearXNG fallback, Semantic Scholar, Crossref)
+requests>=2.32
+
+# ── Utilities ─────────────────────────────────────────────
+# Load .env files automatically
+python-dotenv>=1.0
+
+# ── Verification Agent ────────────────────────────────────
+# NLI model running locally on CPU
+transformers>=4.40
+torch>=2.0

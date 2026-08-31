@@ -1,26 +1,15 @@
-from langchain_ollama import ChatOllama
+import logging
 
 from search.academic_search_manager import academic_search
 
 from config import (
-    OLLAMA_MODEL,
-    OLLAMA_BASE_URL,
-    OLLAMA_TEMPERATURE,
     LITERATURE_SEARCH_MAX_RESULTS,
     MAX_ACADEMIC_SOURCES,
 )
 
+from llm_client import create_llm
 
-# ============================================================
-# LLM
-# ============================================================
-
-def create_llm():
-    return ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=OLLAMA_TEMPERATURE,
-    )
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -251,11 +240,19 @@ Do not create a bibliography.
 Return ONLY the literature analysis.
 """
 
-    response = llm.invoke(
-        prompt
-    )
+    try:
 
-    return response.content.strip()
+        response = llm.invoke(prompt)
+
+        return response.content.strip()
+
+    except Exception as error:
+
+        logger.error(
+            "[Literature Agent] LLM call failed: %s", error
+        )
+
+        return ""
 
 
 # ============================================================

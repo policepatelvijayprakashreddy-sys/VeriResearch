@@ -1,13 +1,11 @@
+import logging
 from typing import List
 
-from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
 
-from config import (
-    OLLAMA_BASE_URL,
-    OLLAMA_MODEL,
-    OLLAMA_TEMPERATURE,
-)
+from llm_client import create_llm
+
+logger = logging.getLogger(__name__)
 
 
 class EvidenceItem(BaseModel):
@@ -79,21 +77,25 @@ Do not invent facts, sources, authors, dates, statistics, or conclusions.
 Do not include evidence that is not present in the supplied source content.
 """
 
-    llm = ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=OLLAMA_TEMPERATURE,
-    )
+    llm = create_llm()
 
     structured_llm = llm.with_structured_output(
         EvidenceOutput
     )
 
-    response = structured_llm.invoke(
-        prompt
-    )
+    try:
 
-    return response
+        response = structured_llm.invoke(prompt)
+
+        return response
+
+    except Exception as error:
+
+        logger.error(
+            "[Evidence Agent] Structured LLM call failed: %s", error
+        )
+
+        return EvidenceOutput(items=[])
 
 
 # ============================================================

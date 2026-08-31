@@ -1,7 +1,10 @@
+import logging
 import re
 import time
 
 import requests
+
+from search.cache import get_cached, set_cached
 
 from config import (
     SEMANTIC_SCHOLAR_BASE_URL,
@@ -278,6 +281,17 @@ def metadata_quality_score(result):
         score += 1
 
     return score
+
+
+def rank_academic_results(results):
+    """
+    Rank academic sources by metadata completeness.
+    """
+    return sorted(
+        results,
+        key=metadata_quality_score,
+        reverse=True
+    )
 
 
 # ============================================================
@@ -794,6 +808,12 @@ def academic_search(
         return []
 
     query = query.strip()
+    
+    from config import SEARCH_CACHE_ENABLED
+    if SEARCH_CACHE_ENABLED:
+        cached = get_cached("acad:" + query, max_results)
+        if cached is not None:
+            return cached
 
     # ========================================================
     # PRIMARY
@@ -805,7 +825,8 @@ def academic_search(
     )
 
     if results:
-
+        if SEARCH_CACHE_ENABLED:
+            set_cached("acad:" + query, max_results, results)
         return results
 
     # ========================================================
@@ -831,7 +852,8 @@ def academic_search(
     )
 
     if results:
-
+        if SEARCH_CACHE_ENABLED:
+            set_cached("acad:" + query, max_results, results)
         return results
 
     # ========================================================
@@ -903,13 +925,3 @@ if __name__ == "__main__":
             f"Source: "
             f"{result['source']}"
         )
-def rank_academic_results(results):
-    """
-    Rank academic sources by metadata completeness.
-    """
-
-    return sorted(
-        results,
-        key=metadata_quality_score,
-        reverse=True
-    )

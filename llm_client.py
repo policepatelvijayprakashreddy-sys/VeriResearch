@@ -6,14 +6,43 @@ from config import (
     OLLAMA_TEMPERATURE,
 )
 
-def create_llm():
-    """Create the shared ChatOllama client used by all agents."""
+import logging
 
-    return ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=OLLAMA_TEMPERATURE
-    )
+logger = logging.getLogger(__name__)
+
+# ============================================
+# LLM SINGLETON
+# ============================================
+
+_llm_instance = None
+
+
+def create_llm():
+    """
+    Return the shared ChatOllama client used by all agents.
+
+    The instance is created once and reused for the lifetime
+    of the process, avoiding repeated connection overhead.
+    """
+
+    global _llm_instance
+
+    if _llm_instance is None:
+
+        logger.debug(
+            "Creating ChatOllama instance "
+            "(model=%s, url=%s)",
+            OLLAMA_MODEL,
+            OLLAMA_BASE_URL,
+        )
+
+        _llm_instance = ChatOllama(
+            model=OLLAMA_MODEL,
+            base_url=OLLAMA_BASE_URL,
+            temperature=OLLAMA_TEMPERATURE,
+        )
+
+    return _llm_instance
 
 
 def safe_invoke(llm, prompt, default=""):
@@ -39,8 +68,8 @@ def safe_invoke(llm, prompt, default=""):
 
     except Exception as error:
 
-        print(
-            f"[LLM Error] Call failed: {error}"
+        logger.error(
+            "[LLM Error] Call failed: %s", error
         )
 
         return default

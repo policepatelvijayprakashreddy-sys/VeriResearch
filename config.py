@@ -1,5 +1,11 @@
 import os
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed; rely on environment variables
+
 # ============================================
 # LLM CONFIGURATION
 # ============================================
@@ -90,3 +96,41 @@ ACADEMIC_DOMAINS = [
 	"oup.com",
 	"academic.oup.com",
 ]
+
+# ============================================
+# VERIFICATION AGENT (NLI)
+# ============================================
+
+# Set to False to bypass verification (ablation / fast runs)
+ENABLE_VERIFICATION = os.getenv("ENABLE_VERIFICATION", "true").lower() == "true"
+
+# HuggingFace NLI model — downloads ~185 MB on first run, cached locally
+NLI_MODEL_NAME = "cross-encoder/nli-deberta-v3-small"
+
+# Minimum confidence to trust an NLI label (0.0-1.0)
+NLI_CONFIDENCE_THRESHOLD = 0.70
+
+# ============================================
+# SOURCE DIVERSITY TARGETS
+# ============================================
+
+# Target: 30-50% academic for scientific topics
+SOURCE_DIVERSITY_TARGET_MIN = 0.30
+SOURCE_DIVERSITY_TARGET_MAX = 0.50
+
+# ============================================
+# SEARCH CACHE
+# ============================================
+
+SEARCH_CACHE_ENABLED = os.getenv("SEARCH_CACHE_ENABLED", "true").lower() == "true"
+SEARCH_CACHE_TTL_HOURS = int(os.getenv("SEARCH_CACHE_TTL_HOURS", "24"))
+SEARCH_CACHE_DIR = os.path.join(
+    os.path.dirname(__file__), "data", "search_cache"
+)
+
+# ============================================
+# SOURCE RECENCY
+# ============================================
+
+# Warn in report if source is older than this many years
+SOURCE_RECENCY_WARNING_YEARS = 5
