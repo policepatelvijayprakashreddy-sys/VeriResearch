@@ -1,7 +1,9 @@
 {
-  "python.defaultInterpreterPath": "${workspaceFolder}/venv/Scripts/python.exe",
+  "python.defaultInterpreterPath": "${workspaceFolder}\\venv\\Scripts\\python.exe",
+  "python.pythonPath": "${workspaceFolder}\\venv\\Scripts\\python.exe",
   "python.analysis.extraPaths": [
-    "${workspaceFolder}"
+    "${workspaceFolder}",
+    "${workspaceFolder}\\venv\\Lib\\site-packages"
   ],
   "python.analysis.typeCheckingMode": "off",
   "python.analysis.diagnosticSeverityOverrides": {
@@ -12,5 +14,7 @@
     "reportOptionalMemberAccess": "none",
     "reportUnknownMemberType": "none",
     "reportShadowedImports": "none"
-  }
+  },
+  "python.analysis.autoSearchPaths": true,
+  "python.terminal.activateEnvironment": true
 }
