@@ -1,7 +1,35 @@
 import argparse
 import logging
 import os
+import sys
+import warnings
 from datetime import datetime
+
+# ── 1. Suppress all library warnings (LangChain, HuggingFace, Pydantic, etc.) ──
+try:
+    from langchain_core._api.deprecation import (
+        LangChainDeprecationWarning,
+        LangChainPendingDeprecationWarning,
+    )
+    warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
+    warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
+except ImportError:
+    pass
+warnings.filterwarnings("ignore")
+
+# ── 2. Suppress C-level and third-party library verbose output ──
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# ── 3. Ensure UTF-8 output on Windows consoles ──
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from orchestrator.orchestrator import run_research
 from evaluation.eval_harness import (
@@ -20,6 +48,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+
+# Silence noisy third-party networking/HTTP loggers
+for noisy in ["httpx", "httpcore", "primp", "rquest", "urllib3", "transformers", "torch"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -224,4 +256,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[Interrupted] Research cancelled by user.")
+        sys.exit(0)

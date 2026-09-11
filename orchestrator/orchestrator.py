@@ -1,5 +1,18 @@
 import logging
+import warnings
 from typing import TypedDict, Any
+
+# Suppress LangChain / LangGraph internal deprecation notices
+try:
+    from langchain_core._api.deprecation import (
+        LangChainDeprecationWarning,
+        LangChainPendingDeprecationWarning,
+    )
+    warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
+    warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
+except ImportError:
+    pass
+warnings.filterwarnings("ignore")
 
 from langgraph.graph import StateGraph, START, END
 
@@ -100,10 +113,11 @@ def research_node(state: ResearchState):
     # --------------------------------------------------------
 
     try:
-
+        follow_up = state.get("follow_up_query", "") if current_round > 1 else ""
         result = research_agent(
             state["topic"],
-            previous_research
+            previous_research,
+            follow_up_query=follow_up
         )
 
     except Exception as error:
@@ -436,11 +450,16 @@ def evidence_node(state: ResearchState):
             source_id = item.source_id.strip()
             source = source_records.get(source_id)
 
-            if source is None:
-                matched_source = sources_by_url.get(
-                    source_id.lower()
-                )
+            if source is None and f"source_{source_id}" in source_records:
+                source_id = f"source_{source_id}"
+                source = source_records[source_id]
 
+            if source is None:
+                item_url = getattr(item, "source_url", "").strip().lower()
+                matched_source = (
+                    sources_by_url.get(source_id.lower())
+                    or (sources_by_url.get(item_url) if item_url else None)
+                )
                 if matched_source:
                     source_id, source = matched_source
 
@@ -590,9 +609,14 @@ def critic_node(state: ResearchState):
 
     logger.info("[Critic Decision] %s", decision)
 
+    knowledge_gap = getattr(result, "knowledge_gap", "")
+    follow_up_query = getattr(result, "follow_up_query", "")
+
     return {
         "critique": result,
-        "decision": decision
+        "decision": decision,
+        "knowledge_gap": knowledge_gap,
+        "follow_up_query": follow_up_query,
     }
 
 
@@ -665,7 +689,7 @@ def route_after_critic(
 
     if (
         decision == "MORE_RESEARCH"
-        and research_round > MAX_RESEARCH_ROUNDS
+        and research_round >= MAX_RESEARCH_ROUNDS
     ):
 
         logger.info("[Graph Decision] Maximum research rounds reached.")

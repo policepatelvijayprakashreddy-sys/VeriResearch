@@ -275,7 +275,11 @@ def search(
         )
 
         return []
-        
+
+    query = clean_query(query)
+    if not query:
+        return []
+
     from config import SEARCH_CACHE_ENABLED
     if SEARCH_CACHE_ENABLED:
         cached = get_cached(query, max_results)

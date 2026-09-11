@@ -16,11 +16,20 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime
 
+# Ensure UTF-8 output on Windows consoles to prevent UnicodeEncodeError
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import config
-from main import run_research
+from orchestrator.orchestrator import run_research
 from evaluation.eval_harness import run_eval, save_eval_report
 
 logger = logging.getLogger(__name__)

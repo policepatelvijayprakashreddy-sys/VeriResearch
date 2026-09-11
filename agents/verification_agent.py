@@ -29,7 +29,12 @@ Graceful fallback:
 """
 
 import logging
-from typing import List, Optional
+import sys
+from pathlib import Path
+from typing import Optional
+
+# Ensure project root is in sys.path when running script directly
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logger = logging.getLogger(__name__)
 

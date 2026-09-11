@@ -1,4 +1,9 @@
 import logging
+import sys
+from pathlib import Path
+
+# Ensure project root is in sys.path when running script directly
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from search.search_manager import search
 from llm_client import create_llm, safe_invoke
@@ -182,7 +187,8 @@ def merge_sources(
 
 def research_agent(
     topic,
-    previous_research=""
+    previous_research="",
+    follow_up_query=""
 ):
     """
     Perform web research and return both the
@@ -195,10 +201,13 @@ def research_agent(
     # INITIAL QUERY
     # =========================================
 
-    query = generate_initial_query(
-        llm,
-        topic
-    )
+    if follow_up_query and follow_up_query.strip():
+        query = follow_up_query.strip()
+    else:
+        query = generate_initial_query(
+            llm,
+            topic
+        )
 
     logger.info("[Research Search]")
     logger.info("Search query: %s", query)

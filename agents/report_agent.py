@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+# Ensure project root is in sys.path when running script directly
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from llm_client import create_llm, safe_invoke
 
 
@@ -106,8 +112,8 @@ def report_agent(
                 # Try to link it to the citation number if possible
                 cit_num = ""
                 for k, v in citation_numbers.items():
-                    if uc["source_url"] == v:
-                        cit_num = f"[{k}] "
+                    if uc["source_url"] == k:
+                        cit_num = f"[{v}] "
                         break
                         
                 unverified_section += f"- {icon} \"{uc['claim']}\"\n"
