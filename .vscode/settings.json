@@ -6,9 +6,11 @@
   "python.analysis.typeCheckingMode": "off",
   "python.analysis.diagnosticSeverityOverrides": {
     "reportMissingImports": "none",
+    "reportMissingModuleSource": "none",
     "reportUnusedImport": "none",
     "reportGeneralTypeIssues": "none",
     "reportOptionalMemberAccess": "none",
-    "reportUnknownMemberType": "none"
+    "reportUnknownMemberType": "none",
+    "reportShadowedImports": "none"
   }
 }

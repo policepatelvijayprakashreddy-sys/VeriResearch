@@ -36,6 +36,17 @@ from typing import Optional
 # Ensure project root is in sys.path when running script directly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+try:
+    from transformers import pipeline as hf_pipeline
+except ImportError:
+    hf_pipeline = None
+
+from config import (
+    NLI_MODEL_NAME,
+    NLI_CONFIDENCE_THRESHOLD,
+    ENABLE_VERIFICATION,
+)
+
 logger = logging.getLogger(__name__)
 
 # NLI label constants
@@ -88,10 +99,16 @@ def _load_nli_pipeline():
     if _nli_pipeline is not None:
         return _nli_pipeline
 
-    try:
-        from transformers import pipeline as hf_pipeline
-        from config import NLI_MODEL_NAME
+    if hf_pipeline is None:
+        logger.warning(
+            "[Verification] transformers / torch not installed. "
+            "Run: pip install transformers torch --index-url "
+            "https://download.pytorch.org/whl/cpu\n"
+            "All claims will be labelled UNVERIFIED."
+        )
+        return None
 
+    try:
         logger.info(
             "[Verification] Loading NLI model: %s "
             "(first run downloads ~185 MB)...",
@@ -107,15 +124,6 @@ def _load_nli_pipeline():
 
         logger.info("[Verification] NLI model loaded.")
         return _nli_pipeline
-
-    except ImportError:
-        logger.warning(
-            "[Verification] transformers / torch not installed. "
-            "Run: pip install transformers torch --index-url "
-            "https://download.pytorch.org/whl/cpu\n"
-            "All claims will be labelled UNVERIFIED."
-        )
-        return None
 
     except Exception as error:
         logger.error(
@@ -195,8 +203,6 @@ def verification_agent(
     dict  (VerificationSummary)
         results, counts, and the hallucination_rate headline metric.
     """
-    from config import NLI_CONFIDENCE_THRESHOLD, ENABLE_VERIFICATION
-
     results: list = []
 
     if not evidence_items:
