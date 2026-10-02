@@ -4,6 +4,17 @@ __pycache__/
 *.pyc
 .env
 
+# Auto-generated research reports (ignore bulk/intermediate runs, keep only top verified outputs)
+reports/*.md
+!reports/README.md
+!reports/20261002_180944_Security_vulnerabilities_in_LLM-generated_code.md
+!reports/20261002_181025_Security_vulnerabilities_in_LLM-generated_code_eval.md
+!reports/20261002_170207_AI_in_automobile.md
+!reports/20261002_170246_AI_in_automobile_eval.md
+!reports/20261002_160518_uav_localisation.md
+!reports/20261002_160556_uav_localisation_eval.md
+!reports/20261002_163029_federated_learning_medical_imaging_recommendations.md
+
 # Runtime data
 data/
 *.log
