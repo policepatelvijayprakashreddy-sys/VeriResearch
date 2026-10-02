@@ -4,8 +4,11 @@ __pycache__/
 *.pyc
 .env
 
-# Auto-generated research reports
+# Auto-generated research reports (ignore bulk runs, include curated showcase samples)
 reports/*.md
+!reports/20261002_180944_Security_vulnerabilities_in_LLM-generated_code.md
+!reports/20261002_181025_Security_vulnerabilities_in_LLM-generated_code_eval.md
+!reports/20261002_163029_federated_learning_medical_imaging_recommendations.md
 
 # Runtime data
 data/
