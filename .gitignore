@@ -13,7 +13,6 @@ reports/*.md
 !reports/20261002_170246_AI_in_automobile_eval.md
 !reports/20261002_160518_uav_localisation.md
 !reports/20261002_160556_uav_localisation_eval.md
-!reports/20261002_163029_federated_learning_medical_imaging_recommendations.md
 
 # Runtime data
 data/

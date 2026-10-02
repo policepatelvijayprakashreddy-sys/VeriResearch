@@ -200,7 +200,6 @@ Explore verified benchmark outputs produced by VeriResearch:
 - 🚗 [**Automated Evaluation Scorecard (AI in Automobile - Score: 7.38 / 10)**](reports/20261002_170246_AI_in_automobile_eval.md)
 - 🚁 [**Full Research Report (UAV Localisation)**](reports/20261002_160518_uav_localisation.md)
 - 🚁 [**Automated Evaluation Scorecard (UAV Localisation - Score: 7.45 / 10)**](reports/20261002_160556_uav_localisation_eval.md)
-- 💡 [**Project Recommendations (Federated learning medical imaging privacy)**](reports/20261002_163029_federated_learning_medical_imaging_recommendations.md)
 - 📑 [**Reports Directory Overview**](reports/README.md)
 
 ---

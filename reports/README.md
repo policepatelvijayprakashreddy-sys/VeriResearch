@@ -11,7 +11,6 @@ This directory contains the verified research reports, project recommendations, 
 | **LLM Code Security** | [📄 Security vulnerabilities in LLM-generated code](20261002_180944_Security_vulnerabilities_in_LLM-generated_code.md) | [📊 Scorecard (7.64 / 10)](20261002_181025_Security_vulnerabilities_in_LLM-generated_code_eval.md) | 16 inline citations (100% coverage), 8 peer-reviewed papers (IEEE TDSC, SSRN, ACM TOCE), 0.0% NLI contradiction rate. |
 | **Autonomous Vehicles** | [📄 AI in Automobile](20261002_170207_AI_in_automobile.md) | [📊 Scorecard (7.38 / 10)](20261002_170246_AI_in_automobile_eval.md) | Verified academic venues (IEEE Transactions), complete retraction and venue provenance audit table. |
 | **Drone Navigation** | [📄 UAV Localisation](20261002_160518_uav_localisation.md) | [📊 Scorecard (7.45 / 10)](20261002_160556_uav_localisation_eval.md) | Sensor fusion & GPS-denied navigation literature synthesis with full citation grounding. |
-| **Medical AI & Privacy** | [💡 Federated Learning Medical Imaging](20261002_163029_federated_learning_medical_imaging_recommendations.md) | *Recommendation Mode* | Under-explored research gaps and feasibility scoring across differential privacy & medical imaging. |
 
 ---
 
