@@ -86,16 +86,14 @@ Current research summary:
 
 Identify ONE important knowledge gap.
 
-Then create ONE search query that would specifically
-help investigate that gap.
-
-The query should be different from a generic search
-for the research topic.
+Then create ONE concise search query (3 to 6 keywords only) that would
+specifically help investigate that gap. Do NOT write a complete sentence.
+Do NOT use parentheses, quotes, or boolean operators (AND/OR).
 
 Return exactly:
 
 GAP: <specific missing information>
-QUERY: <specific follow-up search query>
+QUERY: <concise 3-6 keywords search query>
 """
 
     text = safe_invoke(
@@ -123,6 +121,14 @@ QUERY: <specific follow-up search query>
                 1
             ).strip()
 
+    # If the LLM generated an overly short or detached query (e.g. "Chain"),
+    # anchor it with the core topic keywords to prevent off-topic search queries.
+    if query:
+        query_words = query.split()
+        if len(query_words) <= 2:
+            topic_keywords = " ".join([w for w in topic.split() if len(w) > 3][:3])
+            query = f"{topic_keywords} {query}"
+
     return gap, query
 
 
@@ -133,15 +139,15 @@ def generate_initial_query(
     """Generate the initial research query."""
 
     prompt = f"""
-Create ONE high-quality web search query
+Create ONE high-quality web search query (3 to 6 keywords)
 for the following research topic:
 
 {topic}
 
-The query should focus on finding useful,
-reliable information about the topic.
+The query should focus on finding useful, reliable research information.
+Keep it short (3 to 6 keywords). Do NOT write a sentence. Do NOT use quotes or parentheses.
 
-Return ONLY the search query.
+Return ONLY the search query keywords.
 """
 
     # Fall back to the raw topic itself if the LLM call fails,

@@ -1,3 +1,4 @@
+import html
 import sys
 from pathlib import Path
 
@@ -16,6 +17,9 @@ def report_agent(
     critic_result,
     evidence,
     verification_results=None,
+    source_quality_table="",
+    consensus_table="",
+    source_quality_profiles=None,
 ):
     """Generate the final research report with verified source lists."""
 
@@ -57,13 +61,33 @@ def report_agent(
             "No academic sources were found."
         )
 
+    # =========================================
+    # UNIFIED CITATION NUMBERING ACROSS ALL SOURCES
+    # =========================================
     citation_sources = []
     citation_numbers = {}
-    evidence_sections = []
 
+    all_retrieved_sources = (literature_sources or []) + (web_sources or [])
+    for src in all_retrieved_sources:
+        url = (src.get("url") or "").strip()
+        if not url or url in citation_numbers:
+            continue
+        citation_numbers[url] = len(citation_sources) + 1
+        citation_sources.append({
+            "title": src.get("title", "Untitled"),
+            "url": url,
+            "venue": src.get("journal_name", src.get("venue", "")),
+            "issn": src.get("issn", ""),
+            "doi": src.get("doi", ""),
+            "is_retracted": src.get("is_retracted", False),
+            "verified_indexes": src.get("verified_indexes", []),
+            "confidence_level": src.get("identity_confidence", src.get("confidence_level", "")),
+            "harvested_from": src.get("source") or ("Semantic Scholar Graph API" if ("10." in url or "semanticscholar.org" in url) else "Web Search"),
+        })
+
+    evidence_sections = []
     for item in evidence:
         source_url = item.get("source_url", "").strip()
-
         if not source_url:
             continue
 
@@ -72,6 +96,13 @@ def report_agent(
             citation_sources.append({
                 "title": item.get("source_title", "Untitled"),
                 "url": source_url,
+                "venue": item.get("venue", ""),
+                "issn": item.get("issn", ""),
+                "doi": item.get("doi", ""),
+                "is_retracted": item.get("is_retracted", False),
+                "verified_indexes": item.get("verified_indexes", []),
+                "confidence_level": item.get("confidence_level", ""),
+                "harvested_from": item.get("harvested_from", ""),
             })
 
         citation_number = citation_numbers[source_url]
@@ -85,12 +116,8 @@ def report_agent(
         )
 
     evidence_information = "\n\n".join(evidence_sections)
-
     if not evidence_information:
-
-        evidence_information = (
-            "No extracted evidence was available."
-        )
+        evidence_information = "No extracted evidence was available."
 
     # =========================================
     # UNVERIFIED CLAIMS (Verification Node)
@@ -100,16 +127,16 @@ def report_agent(
     if verification_results:
         from agents.verification_agent import get_unverified_claims, CONTRADICTION
         unverified_claims = get_unverified_claims({"results": verification_results})
+        valid_unverified = [uc for uc in unverified_claims if len(uc.get("claim", "").strip()) >= 5]
         
-        if unverified_claims:
+        if valid_unverified:
             unverified_section = "\n\n### Claims We Could Not Verify\n\n"
             unverified_section += "The following claims were extracted from sources but our NLI verification model could not confirm that the source text directly entails them. These should be treated with additional scrutiny:\n\n"
             
-            for uc in unverified_claims:
+            for uc in valid_unverified:
                 icon = "❌" if uc["label"] == CONTRADICTION else "⚠️"
                 conf = f" (confidence: {uc['confidence']})" if uc['confidence'] else ""
                 
-                # Try to link it to the citation number if possible
                 cit_num = ""
                 for k, v in citation_numbers.items():
                     if uc["source_url"] == k:
@@ -118,6 +145,11 @@ def report_agent(
                         
                 unverified_section += f"- {icon} \"{uc['claim']}\"\n"
                 unverified_section += f"  Source: {cit_num}[{uc['source_title']}]({uc['source_url']}) | Status: {uc['label']}{conf}\n\n"
+
+    if hasattr(critic_result, "decision"):
+        critic_text = f"Decision: {critic_result.decision}\nReason: {critic_result.reason}\nKnowledge Gap: {getattr(critic_result, 'knowledge_gap', '')}"
+    else:
+        critic_text = str(critic_result)
 
     # =========================================
     # REPORT PROMPT
@@ -141,20 +173,11 @@ LITERATURE ANALYSIS
 
 {literature_analysis}
 
----
-
-## Unverified Claims Data
-If there are unverified claims, include them exactly as provided below inside your "5. Knowledge Gaps" section. Do not alter them.
-{unverified_section}
-
----
-
-## 4. INSTRUCTIONS
 ========================================
 CRITIC REPORT
 ========================================
 
-{critic_result}
+{critic_text}
 
 ========================================
 EVIDENCE AND SUPPORTED CLAIMS
@@ -163,10 +186,13 @@ EVIDENCE AND SUPPORTED CLAIMS
 {evidence_information}
 
 ========================================
-TASK
+TASK & STRICT SCOPE
 ========================================
 
 Write ONLY the main body of the research report.
+The scope is strictly '{topic}'. Do not narrow or drift the topic solely to a sub-aspect.
+Name ONLY papers and models that appear in the provided EVIDENCE snippets. Do not cite papers outside the evidence list.
+MANDATORY ENTITY RULE: Only mention organizations, companies, products, benchmarks, or models that explicitly appear in the provided EVIDENCE section. Do NOT mention outside organizations (such as OpenAI, Gemini, IBM, ChatGPT) unless they are verbatim in the evidence.
 
 Use exactly these sections:
 
@@ -187,7 +213,6 @@ Use exactly these sections:
 ## 7. Conclusion
 
 Do NOT create:
-
 - Section 8
 - Section 9
 - a References section
@@ -197,131 +222,60 @@ Do NOT create:
 Those sections will be created separately by Python.
 
 ========================================
-SECTION RULES
+SECTION RULES & EMPIRICAL RIGOR
 ========================================
 
-### Executive Summary
+CRITICAL REQUIREMENT: AVOID VAGUE GENERALIZATIONS AND DO NOT INVENT PLACEHOLDERS.
+Do NOT write high-level fluff such as "AI is transforming the industry" or copy abstract templates.
+Do NOT invent benchmark names, model names, or statistics if they are not in the evidence.
+If the evidence does not contain specific percentages, describe the qualitative experimental findings accurately.
 
+### 1. Executive Summary
 Summarize:
+- Research scope on {topic} and specific technical questions investigated
+- Major empirical findings directly supported by the reviewed sources with citation tags [N]
+- Primary limitations and conflicting findings identified across sources
+- Evidence-grounded concluding assessment
 
-- the research topic
-- major findings
-- major challenges
-- overall conclusion
+### 2. General Research Findings
+Discuss practical findings from the general web research.
+- Focus on real-world implementations, industry reports, and empirical studies.
+- Anchor all claims with their matching inline citation tags [N].
 
-Keep it concise.
+### 3. Literature Review
+Deep-dive into the peer-reviewed academic literature provided:
+- Compare specific paper methodologies and experimental findings from the evidence.
+- Report concrete empirical observations directly drawn from the evidence.
+- Highlight conflicting or nuanced results between papers where experimental scopes differ.
+- For each paper discussed, note its limitations as reported in the evidence.
 
-### General Research Findings
+### 4. Critical Analysis
+Evaluate the rigor and reliability of the gathered evidence:
+- Synthesize cross-paper findings and highlight where papers agree or differ.
+- Discuss source-quality, peer-review status, and experimental constraints.
+- Identify methodologies that require further validation.
 
-Discuss findings from the general web research.
+### 5. Knowledge Gaps
+Identify specific, actionable technical questions that remain unanswered in current literature on {topic}:
+- Avoid clichés like "Further research is needed."
+- Detail precisely what datasets, evaluation protocols, or technical questions are missing.
 
-Do not turn this section into a literature review.
+### 6. Recommendations
+Provide concrete, actionable research and engineering recommendations directly targeting the gaps.
 
-Use only information supported by the research.
-
-### Literature Review
-
-Discuss the academic literature provided.
-
-For important sources discuss:
-
-- research focus
-- key findings, if available
-- limitations, if available
-
-Do not invent:
-
-- authors
-- dates
-- DOI numbers
-- findings
-- limitations
-
-If information is unavailable, say:
-
-"Not enough information was available."
-
-### Critical Analysis
-
-Evaluate the evidence rather than simply
-repeating the literature review.
-
-Discuss:
-
-- strengths
-- weaknesses
-- source-quality concerns
-- missing information
-- contradictions, if actually supported
-
-### Knowledge Gaps
-
-Identify specific unanswered questions.
-
-Avoid vague statements such as:
-
-"More research is needed."
-
-Explain exactly what information is missing.
-
-### Recommendations
-
-Give recommendations that directly address
-the identified knowledge gaps.
-
-### Conclusion
-
-Summarize the report.
-
-Do not introduce new information.
+### 7. Conclusion
+Synthesize the final evidence-grounded verdict without introducing unverified claims.
 
 ========================================
-IMPORTANT
+CITATION & EVIDENCE RULES
 ========================================
 
-IMPORTANT EVIDENCE RULES
-
-Use the evidence provided above to support
-factual claims.
-
-Do not create factual claims that are not
-supported by the provided evidence.
-
-If a claim cannot be supported by the
-available evidence, do not present it as
-established fact.
-
-Use the citation number shown beside each evidence item.
-Place its marker directly after each supported claim,
-for example: "AI can assist diagnosis [1]."
-Use a citation only for the specific claim it supports;
-do not cite an entire paragraph when claims have different sources.
-Do not cite every sentence unless the evidence supports it.
-Do not invent citation numbers or URLs.
-
-When making an evidence-supported claim,
-associate it with the source that supplied
-the evidence.
-
-Do not invent sources.
-
-Do not invent facts.
-
-Do not invent authors.
-
-Do not invent publication dates.
-
-Do not invent DOI numbers.
-
-Do not create a bibliography.
-
-Do not create Section 8 or Section 9.
-
-Do not repeat the same content unnecessarily.
-
-Use only the information provided above.
-
-Return ONLY Sections 1 through 7.
+- MANDATORY: Every factual claim or empirical statement MUST include its exact inline citation number tag [N] (e.g. [1] or [2]).
+- Do NOT cite papers only by author name or year without the bracketed tag [N].
+- Rely directly on the provided EVIDENCE snippets.
+- Use the citation number shown beside each evidence item in CITATION [N].
+- Place its marker directly after each supported claim (e.g. "Source finding [1].").
+- Return ONLY Sections 1 through 7.
 """
 
     # =========================================
@@ -356,19 +310,83 @@ Return ONLY Sections 1 through 7.
     )
 
     # =========================================
-    # APPEND PYTHON-VERIFIED CITATIONS
+    # APPEND PYTHON-VERIFIED CITATIONS & SOURCE QUALITY
     # =========================================
 
     if citation_sources:
-        sources_section = "\n".join(
-            f"[{index}] [{source['title']}]({source['url']})"
-            for index, source in enumerate(citation_sources, start=1)
-        )
+        sources_lines = []
+        for index, source in enumerate(citation_sources, start=1):
+            title = html.unescape(source.get("title", "Untitled"))
+            url = source.get("url", "")
+            venue = html.unescape(source.get("venue", ""))
+            issn = source.get("issn", "")
+            harvested = source.get("harvested_from") or ("Semantic Scholar Graph API" if ("10." in url or "semanticscholar.org" in url) else "Web Search")
+            verified_indexes = source.get("verified_indexes", [])
+            is_retracted = source.get("is_retracted", False)
+
+            line = f"[{index}] [{title}]({url})"
+            meta_details = []
+
+            meta_details.append(f"**Harvested From:** {harvested}")
+
+            if venue:
+                venue_str = f"**Venue:** *{venue}*"
+                if issn and issn != "N/A":
+                    venue_str += f" (ISSN: `{issn}`)"
+                meta_details.append(venue_str)
+
+            if verified_indexes:
+                badges = " ".join(f"`[{idx}]`" for idx in verified_indexes)
+                meta_details.append(f"**Verified Records:** {badges}")
+
+            identity_conf = source.get("identity_confidence") or source.get("confidence_level", "")
+            if identity_conf:
+                meta_details.append(f"**Identity Verification:** `{identity_conf}`")
+
+            if meta_details:
+                line += "\n    " + " | ".join(meta_details)
+
+            if is_retracted:
+                line += "\n    ⚠️ **RETRACTION ALERT:** This paper has been officially flagged as RETRACTED by scholarly databases."
+
+            sources_lines.append(line)
+
+        sources_section = "\n\n".join(sources_lines)
     else:
         sources_section = "No cited sources were available."
 
+    consensus_section = ""
+    if consensus_table:
+        consensus_section = (
+            "\n\n---\n\n"
+            "## Cross-Paper Scientific Consensus Matrix\n\n"
+            + consensus_table
+        )
+
+    if source_quality_profiles:
+        from agents.source_quality_agent import format_quality_table
+        url_cit_map = {url.lower().strip(): num for url, num in citation_numbers.items()}
+        source_quality_table = format_quality_table(source_quality_profiles, citation_map=url_cit_map)
+
+    quality_audit_section = ""
+    if source_quality_table:
+        quality_audit_section = (
+            "\n\n---\n\n"
+            "## Source Quality & Verification Audit\n\n"
+            + source_quality_table
+        )
+
+    if unverified_section:
+        if "## 6. Recommendations" in report_body:
+            parts = report_body.split("## 6. Recommendations")
+            report_body = parts[0] + unverified_section + "\n\n## 6. Recommendations" + parts[1]
+        else:
+            report_body += unverified_section
+
     final_report = (
         report_body
+        + consensus_section
+        + quality_audit_section
         + "\n\n"
         + "### Sources\n\n"
         + sources_section

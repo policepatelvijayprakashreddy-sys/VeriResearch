@@ -162,6 +162,9 @@ DOI:
 URL:
 {source.get('url', '')}
 
+Journal / Venue:
+{source.get('venue', 'Not available')}
+
 Academic provider:
 {source.get('source', 'Unknown')}
 
@@ -265,26 +268,26 @@ Return ONLY the literature analysis.
 # ============================================================
 
 def literature_agent(
-    topic
+    topic,
+    follow_up_query="",
 ):
     """
     Complete literature research pipeline.
 
-        Topic
+        Topic / Follow-up query
           ↓
     Academic Search Manager
           ↓
-    Semantic Scholar
-          ↓
-    Crossref fallback
+    Semantic Scholar / Crossref fallback
           ↓
     Academic sources
           ↓
     Literature analysis
     """
+    search_term = follow_up_query.strip() if follow_up_query and follow_up_query.strip() else topic
 
     literature_sources = search_literature(
-        topic
+        search_term
     )
 
     literature_analysis = analyze_literature(

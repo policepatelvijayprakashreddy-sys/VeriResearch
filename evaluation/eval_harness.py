@@ -153,9 +153,28 @@ def _check_sections(report_text: str) -> tuple[list[str], list[str]]:
     return found, missing
 
 
+def _get_report_body(report_text: str) -> str:
+    """Extract report body text prior to consensus tables and sources lists."""
+    for marker in [
+        "## Cross-Paper Scientific Consensus",
+        "# Cross-Paper Scientific Consensus",
+        "## Source Quality & Verification Audit",
+        "# Source Quality & Verification Audit",
+        "### Sources",
+        "## Sources",
+        "# Sources",
+        "## General Web Sources",
+        "## Academic Literature Sources"
+    ]:
+        if marker in report_text:
+            report_text = report_text.split(marker)[0]
+    return report_text
+
+
 def _count_citations(report_text: str) -> int:
-    """Count inline citation markers like [1], [2], [12]."""
-    return len(re.findall(r'\[\d+\]', report_text))
+    """Count inline citation markers like [1], [2], [12] in report body only."""
+    body = _get_report_body(report_text)
+    return len(re.findall(r'\[\d+\]', body))
 
 
 def _citation_coverage(citation_count: int, evidence_count: int) -> float:
@@ -421,7 +440,7 @@ def format_eval_summary(report: EvalReport) -> str:
         f"  Evidence   : {report.evidence_item_count} items "
         f"({report.evidence_density} per 1k words)\n"
         f"  Gap noted  : {gap_status}\n"
-        f"  Halluc.    : {f'{report.hallucination_rate*100:.1f}%' if report.hallucination_rate is not None else 'N/A'}\n"
+        f"  Contradiction Rate : {f'{report.hallucination_rate*100:.1f}%' if report.hallucination_rate is not None else 'N/A'}\n"
         f"  {judge_str}Overall: {report.overall_score}/10\n"
         f"{'='*60}"
     )

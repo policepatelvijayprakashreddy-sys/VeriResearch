@@ -134,3 +134,21 @@ SEARCH_CACHE_DIR = os.path.join(
 
 # Warn in report if source is older than this many years
 SOURCE_RECENCY_WARNING_YEARS = 5
+
+# ============================================
+# SCHOLARLY IDENTITY & SOURCE QUALITY VERIFICATION
+# ============================================
+
+OPENALEX_BASE_URL = os.getenv("OPENALEX_BASE_URL", "https://api.openalex.org")
+OPENALEX_MAILTO = os.getenv("OPENALEX_MAILTO", "research-agent@example.com")
+OPENALEX_TIMEOUT_SECONDS = int(os.getenv("OPENALEX_TIMEOUT_SECONDS", "6"))
+
+CROSSREF_VERIFY_BASE_URL = os.getenv("CROSSREF_VERIFY_BASE_URL", "https://api.crossref.org/works")
+CROSSREF_VERIFY_TIMEOUT_SECONDS = int(os.getenv("CROSSREF_VERIFY_TIMEOUT_SECONDS", "4"))
+CROSSREF_VERIFY_MAILTO = os.getenv("CROSSREF_MAILTO") or os.getenv("OPENALEX_MAILTO") or "research-agent@example.com"
+
+QUALITY_CACHE_DIR = os.path.join(
+    os.path.dirname(__file__), "data", "quality_cache"
+)
+QUALITY_CACHE_TTL_HOURS = int(os.getenv("QUALITY_CACHE_TTL_HOURS", "168"))  # 7 days
+

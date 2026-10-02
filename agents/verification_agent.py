@@ -41,11 +41,7 @@ try:
 except ImportError:
     hf_pipeline = None
 
-from config import (
-    NLI_MODEL_NAME,
-    NLI_CONFIDENCE_THRESHOLD,
-    ENABLE_VERIFICATION,
-)
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -102,27 +98,22 @@ def _load_nli_pipeline():
     if hf_pipeline is None:
         logger.warning(
             "[Verification] transformers / torch not installed. "
-            "Run: pip install transformers torch --index-url "
-            "https://download.pytorch.org/whl/cpu\n"
             "All claims will be labelled UNVERIFIED."
         )
         return None
 
     try:
         logger.info(
-            "[Verification] Loading NLI model: %s "
-            "(first run downloads ~185 MB)...",
-            NLI_MODEL_NAME
+            "[Verification] Loading NLI model: %s (CPU text-classification)...",
+            config.NLI_MODEL_NAME
         )
 
         _nli_pipeline = hf_pipeline(
-            "zero-shot-classification",
-            model=NLI_MODEL_NAME,
+            "text-classification",
+            model=config.NLI_MODEL_NAME,
             device=-1,           # CPU
-            multi_label=False,
         )
-
-        logger.info("[Verification] NLI model loaded.")
+        logger.info("[Verification] NLI labels: %s", _nli_pipeline.model.config.id2label)
         return _nli_pipeline
 
     except Exception as error:
@@ -156,29 +147,31 @@ def _verify_one(
         return NEUTRAL, None
 
     try:
-        # zero-shot-classification treats `sequence` as the premise
-        # and `candidate_labels` as hypotheses to test
-        candidate_labels = [ENTAILMENT, NEUTRAL, CONTRADICTION]
-
-        # We frame it as: given this evidence snippet, does it
-        # ENTAIL, stay NEUTRAL, or CONTRADICT the claim?
-        result = pipe(
-            sequences=evidence[:1024],          # truncate long snippets
-            candidate_labels=candidate_labels,
-            hypothesis_template=f"This text {{}}s the following: {claim[:256]}",
+        out = pipe(
+            {"text": evidence[:1024], "text_pair": claim[:256]},
+            top_k=None,
+            truncation=True,
         )
+        if out and isinstance(out[0], list):
+            out = out[0]
+        elif out and isinstance(out, dict):
+            out = [out]
 
-        top_label      = result["labels"][0]
-        top_confidence = result["scores"][0]
+        best = max(out, key=lambda o: o["score"])
+        label = best["label"].upper()
+        if label not in (ENTAILMENT, NEUTRAL, CONTRADICTION):
+            label_map = {
+                "LABEL_0": CONTRADICTION,
+                "LABEL_1": NEUTRAL,
+                "LABEL_2": ENTAILMENT,
+            }
+            label = label_map.get(label, NEUTRAL)
 
-        # If confidence is below threshold, default to NEUTRAL
-        if top_confidence < threshold:
-            return NEUTRAL, top_confidence
-
-        return top_label, top_confidence
-
-    except Exception as error:
-        logger.debug("[Verification] NLI call failed for one item: %s", error)
+        if label != NEUTRAL and best["score"] < threshold:
+            return NEUTRAL, best["score"]
+        return label, best["score"]
+    except Exception as e:
+        logger.debug("[Verification] NLI failed: %s", e)
         return NEUTRAL, None
 
 
@@ -208,7 +201,7 @@ def verification_agent(
     if not evidence_items:
         return _empty_summary()
 
-    if not ENABLE_VERIFICATION:
+    if not config.ENABLE_VERIFICATION:
         logger.info(
             "[Verification] Disabled by config (ENABLE_VERIFICATION=false). "
             "Marking all claims as UNVERIFIED."
@@ -249,7 +242,7 @@ def verification_agent(
         evidence = item.get("evidence", "")
 
         label, conf = _verify_one(
-            claim, evidence, pipe, NLI_CONFIDENCE_THRESHOLD
+            claim, evidence, pipe, config.NLI_CONFIDENCE_THRESHOLD
         )
 
         results.append({
@@ -270,13 +263,14 @@ def verification_agent(
     summary = _build_summary(results)
 
     logger.info(
-        "[Verification] Done. "
-        "ENTAILMENT: %d | NEUTRAL: %d | CONTRADICTION: %d | "
-        "Hallucination rate: %.1f%%",
+        "[Verification] Grounding Audit Complete. "
+        "Grounded (Entailed): %d (%.1f%%) | Unsupported (Neutral): %d (%.1f%%) | Contradicted: %d (%.1f%%)",
         summary["entailment_count"],
-        summary["neutral_count"],
+        (summary["grounded_rate"] or 0.0) * 100,
+        summary["unsupported_count"],
+        (summary["unsupported_rate"] or 0.0) * 100,
         summary["contradiction_count"],
-        (summary["hallucination_rate"] or 0.0) * 100,
+        (summary["contradiction_rate"] or 0.0) * 100,
     )
 
     return summary
@@ -298,25 +292,29 @@ def _build_summary(results: list) -> dict:
 
     verified = total - unverified_count
 
-    hallucination_rate = (
-        (neutral_count + contradiction_count) / verified
-        if verified > 0
-        else None
-    )
-
-    entailment_rate    = entailment_count    / verified if verified > 0 else None
-    neutral_rate       = neutral_count       / verified if verified > 0 else None
+    # Scientific calibration:
+    # Grounded: source directly entails the derived claim
+    # Unsupported: source snippet alone does not provide sufficient proof (neutral)
+    # Contradicted / Hallucinated: source text directly refutes the claim
+    grounded_rate      = entailment_count    / verified if verified > 0 else None
+    unsupported_rate   = neutral_count       / verified if verified > 0 else None
     contradiction_rate = contradiction_count / verified if verified > 0 else None
+    # For backward compatibility with eval harnesses
+    hallucination_rate = contradiction_rate
 
     return {
         "results":             results,
         "entailment_count":    entailment_count,
+        "grounded_count":      entailment_count,
         "neutral_count":       neutral_count,
+        "unsupported_count":   neutral_count,
         "contradiction_count": contradiction_count,
         "unverified_count":    unverified_count,
         "total":               total,
-        "entailment_rate":     round(entailment_rate,    3) if entailment_rate    is not None else None,
-        "neutral_rate":        round(neutral_rate,       3) if neutral_rate       is not None else None,
+        "entailment_rate":     round(grounded_rate,      3) if grounded_rate      is not None else None,
+        "grounded_rate":       round(grounded_rate,      3) if grounded_rate      is not None else None,
+        "neutral_rate":        round(unsupported_rate,   3) if unsupported_rate   is not None else None,
+        "unsupported_rate":    round(unsupported_rate,   3) if unsupported_rate   is not None else None,
         "contradiction_rate":  round(contradiction_rate, 3) if contradiction_rate is not None else None,
         "hallucination_rate":  round(hallucination_rate, 3) if hallucination_rate is not None else None,
     }
@@ -325,10 +323,12 @@ def _build_summary(results: list) -> dict:
 def _empty_summary() -> dict:
     return {
         "results": [],
-        "entailment_count": 0, "neutral_count": 0,
+        "entailment_count": 0, "grounded_count": 0,
+        "neutral_count": 0, "unsupported_count": 0,
         "contradiction_count": 0, "unverified_count": 0,
         "total": 0,
-        "entailment_rate": None, "neutral_rate": None,
+        "entailment_rate": None, "grounded_rate": None,
+        "neutral_rate": None, "unsupported_rate": None,
         "contradiction_rate": None, "hallucination_rate": None,
     }
 

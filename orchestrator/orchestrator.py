@@ -18,6 +18,7 @@ from langgraph.graph import StateGraph, START, END
 
 from agents.research_agent import research_agent
 from agents.literature_agent import literature_agent
+from agents.source_quality_agent import source_quality_agent
 from agents.evidence_agent import extract_evidence
 from agents.critic_agent import critic_agent
 from agents.report_agent import report_agent
@@ -26,7 +27,9 @@ from agents.recommendation_agent import (
     format_recommendations_md,
 )
 from agents.verification_agent import verification_agent
+from agents.consensus_agent import consensus_agent
 
+import config
 from config import (
     MAX_WEB_SOURCES,
     MAX_ACADEMIC_SOURCES,
@@ -54,10 +57,19 @@ class ResearchState(TypedDict, total=False):
     # Academic research
     literature: dict
 
+    # Source quality & verification
+    source_quality_profiles: list
+    source_quality_table: str
+    retraction_warnings: list
+
     # Extracted evidence
     evidence: list
     verification_results: list
     hallucination_rate: float
+
+    # Cross-paper consensus
+    consensus_profiles: list
+    consensus_table: str
 
     # Critic
     critique: Any
@@ -171,6 +183,10 @@ def research_node(state: ResearchState):
         ""
     )
 
+    prev_web_urls = {s.get("url", "").strip().lower() for s in previous_web_sources if s.get("url")}
+    truly_new_web = [s for s in new_sources if s.get("url", "").strip().lower() not in prev_web_urls]
+    new_sources_found = bool(truly_new_web) if current_round > 1 else bool(new_sources)
+
     # --------------------------------------------------------
     # Combine previous + new web sources
     # --------------------------------------------------------
@@ -273,10 +289,13 @@ def literature_node(state: ResearchState):
     # Ask Literature Agent for NEW sources
     # --------------------------------------------------------
 
+    follow_up = state.get("follow_up_query", "") if state.get("research_round", 1) > 1 else ""
+
     try:
 
         result = literature_agent(
-            state["topic"]
+            state["topic"],
+            follow_up_query=follow_up
         )
 
     except Exception as error:
@@ -306,6 +325,10 @@ def literature_node(state: ResearchState):
     )
 
     new_sources = literature_sources
+
+    prev_lit_urls = {s.get("url", "").strip().lower() for s in previous_sources if s.get("url")}
+    truly_new_lit = [s for s in new_sources if s.get("url", "").strip().lower() not in prev_lit_urls]
+    new_literature_found = bool(truly_new_lit) if state.get("research_round", 1) > 1 else bool(new_sources)
 
     # --------------------------------------------------------
     # Merge previous + new
@@ -344,6 +367,24 @@ def literature_node(state: ResearchState):
         )
 
     # --------------------------------------------------------
+    # Relevance Pre-Filter (Drops off-topic keyword false-positives)
+    # --------------------------------------------------------
+    import re
+    STOP_FILTER = {"a", "an", "the", "in", "on", "of", "and", "for", "with", "to", "at", "by", "from", "is", "are", "via", "using", "as", "system", "study", "paper"}
+    topic_keywords = {w for w in re.findall(r"[a-z0-9]{3,}", state.get("topic", "").lower()) if w not in STOP_FILTER}
+
+    if topic_keywords:
+        relevant_sources = []
+        for s in unique_sources:
+            text = f"{s.get('title', '')} {s.get('content', '')}".lower()
+            match_count = sum(1 for w in topic_keywords if w in text)
+            if match_count >= min(2, len(topic_keywords)):
+                relevant_sources.append(s)
+        if relevant_sources:
+            logger.info("[Literature Node] Relevance filter kept %d/%d academic papers.", len(relevant_sources), len(unique_sources))
+            unique_sources = relevant_sources
+
+    # --------------------------------------------------------
     # Limit total academic sources
     # --------------------------------------------------------
 
@@ -380,6 +421,57 @@ def literature_node(state: ResearchState):
             new_sources
         )
     }
+
+
+# ============================================================
+# SOURCE QUALITY NODE
+# ============================================================
+
+def source_quality_node(state: ResearchState):
+    """
+    Verify paper provenance, retraction status, DOI identity,
+    and journal registration for all gathered academic sources.
+    """
+    logger.info("Running Source Quality Verification Node...")
+
+    literature = state.get("literature", {})
+    literature_sources = literature.get("sources", [])
+
+    if not literature_sources:
+        return {
+            "source_quality_profiles": [],
+            "source_quality_table": "",
+            "retraction_warnings": []
+        }
+
+    audit = source_quality_agent(literature_sources)
+
+    # Keep literature sources enriched with verified quality fields
+    literature["sources"] = audit["enriched_sources"]
+
+    return {
+        "literature": literature,
+        "source_quality_profiles": audit["profiles"],
+        "source_quality_table": audit["markdown_table"],
+        "retraction_warnings": audit["retraction_warnings"]
+    }
+
+
+def _norm_text(s: str) -> str:
+    import re
+    return re.sub(r"\W+", " ", (s or "").lower()).strip()
+
+
+def evidence_in_source(evidence: str, source: dict, min_ratio: float = 0.70) -> bool:
+    import difflib
+    ev = _norm_text(evidence)
+    src = _norm_text(f"{source.get('title','')} {source.get('content','')}")
+    if not ev or not src:
+        return False
+    if ev in src:
+        return True
+    m = difflib.SequenceMatcher(None, src, ev, autojunk=False).find_longest_match(0, len(src), 0, len(ev))
+    return (m.size / len(ev)) >= min_ratio
 
 
 # ============================================================
@@ -447,6 +539,11 @@ def evidence_node(state: ResearchState):
         evidence_items = []
 
         for item in result.items:
+            claim_text = (getattr(item, "claim", "") or "").strip()
+            evidence_text = (getattr(item, "evidence", "") or "").strip()
+            if not claim_text or not evidence_text or len(claim_text) < 5:
+                continue
+
             source_id = item.source_id.strip()
             source = source_records.get(source_id)
 
@@ -466,6 +563,14 @@ def evidence_node(state: ResearchState):
             if source is None:
                 continue
 
+            # Verify that the extracted evidence actually appears in the source content
+            if not evidence_in_source(evidence_text, source):
+                logger.debug(
+                    "[Evidence Node] Dropping mismatched quote for %s: %s",
+                    source_id, evidence_text[:60]
+                )
+                continue
+
             evidence_items.append({
                 "source_id": source_id,
                 "source_title": source.get(
@@ -473,8 +578,15 @@ def evidence_node(state: ResearchState):
                     item.source_title
                 ),
                 "source_url": source.get("url", ""),
-                "evidence": item.evidence,
-                "claim": item.claim,
+                "evidence": evidence_text,
+                "claim": claim_text,
+                "venue": source.get("journal_name", source.get("venue", "")),
+                "issn": source.get("issn", ""),
+                "doi": source.get("doi", ""),
+                "is_retracted": source.get("is_retracted", False),
+                "verified_indexes": source.get("verified_indexes", []),
+                "confidence_level": source.get("confidence_level", "LOW"),
+                "harvested_from": source.get("source", "Web Search"),
             })
 
     except Exception as error:
@@ -527,6 +639,42 @@ def verification_node(state: ResearchState):
         }
 
 # ============================================================
+# CONSENSUS NODE (Stage 2: Cross-Paper Claim Consensus)
+# ============================================================
+
+def consensus_node(state: ResearchState):
+    logger.info("Running Cross-Paper Consensus Agent...")
+    evidence_items = state.get("evidence", [])
+    verification_results = state.get("verification_results", [])
+    literature = state.get("literature", {})
+    literature_sources = literature.get("sources", [])
+
+    if not evidence_items or not literature_sources:
+        return {
+            "consensus_profiles": [],
+            "consensus_table": "",
+        }
+
+    try:
+        res = consensus_agent(
+            evidence_items=evidence_items,
+            verification_results=verification_results,
+            literature_sources=literature_sources,
+            max_claims=5,
+            topic=state.get("topic", ""),
+        )
+        return {
+            "consensus_profiles": res.get("profiles", []),
+            "consensus_table": res.get("markdown_table", ""),
+        }
+    except Exception as error:
+        logger.error("[Consensus Node] Failed: %s", error)
+        return {
+            "consensus_profiles": [],
+            "consensus_table": "",
+        }
+
+# ============================================================
 # CRITIC NODE
 # ============================================================
 
@@ -566,7 +714,10 @@ def critic_node(state: ResearchState):
             state.get(
                 "evidence",
                 []
-            )
+            ),
+            source_quality_table=state.get("source_quality_table", ""),
+            retraction_warnings=state.get("retraction_warnings", []),
+            consensus_table=state.get("consensus_table", ""),
         )
 
     except Exception as error:
@@ -611,6 +762,11 @@ def critic_node(state: ResearchState):
 
     knowledge_gap = getattr(result, "knowledge_gap", "")
     follow_up_query = getattr(result, "follow_up_query", "")
+    if follow_up_query:
+        topic_words = state.get("topic", "").split()[:4]
+        topic_prefix = " ".join(topic_words)
+        if topic_prefix.lower() not in follow_up_query.lower():
+            follow_up_query = f"{topic_prefix} {follow_up_query}"
 
     return {
         "critique": result,
@@ -737,6 +893,23 @@ def report_node(state: ResearchState):
         "evidence",
         []
     )
+    verification_results = state.get("verification_results", [])
+
+    # If verification is enabled, strictly filter out contradicted (hallucinated) claims
+    if config.ENABLE_VERIFICATION and verification_results:
+        verified_map = {r.get("claim", "").strip(): r.get("label") for r in verification_results}
+        uncontradicted_evidence = [
+            ev for ev in evidence
+            if verified_map.get(ev.get("claim", "").strip()) != "CONTRADICTION"
+        ]
+        report_evidence = uncontradicted_evidence if uncontradicted_evidence else evidence
+        logger.info(
+            "[Report Node] Evidence count: %d total, %d passed verification (dropped %d contradicted).",
+            len(evidence), len(report_evidence), len(evidence) - len(report_evidence)
+        )
+    else:
+        report_evidence = evidence
+        logger.info("[Report Node] Verification disabled; passing all %d evidence items.", len(evidence))
 
     # --------------------------------------------------------
     # Generate final report
@@ -764,12 +937,12 @@ def report_node(state: ResearchState):
                 ""
             ),
 
-            evidence,
+            report_evidence,
             
-            state.get(
-                "verification_results",
-                []
-            )
+            verification_results,
+            source_quality_table=state.get("source_quality_table", ""),
+            consensus_table=state.get("consensus_table", ""),
+            source_quality_profiles=state.get("source_quality_profiles", []),
         )
 
     except Exception as error:
@@ -870,17 +1043,21 @@ def _build_graph():
 
     workflow.add_node("research", research_node)
     workflow.add_node("literature", literature_node)
+    workflow.add_node("source_quality", source_quality_node)
     workflow.add_node("evidence", evidence_node)
     workflow.add_node("verification", verification_node)
+    workflow.add_node("consensus", consensus_node)
     workflow.add_node("critic", critic_node)
     workflow.add_node("report", report_node)
     workflow.add_node("recommendation", recommendation_node)
 
     workflow.add_edge(START, "research")
     workflow.add_edge("research", "literature")
-    workflow.add_edge("literature", "evidence")
+    workflow.add_edge("literature", "source_quality")
+    workflow.add_edge("source_quality", "evidence")
     workflow.add_edge("evidence", "verification")
-    workflow.add_edge("verification", "critic")
+    workflow.add_edge("verification", "consensus")
+    workflow.add_edge("consensus", "critic")
 
     workflow.add_conditional_edges(
         "critic",
@@ -891,8 +1068,7 @@ def _build_graph():
         }
     )
 
-    workflow.add_edge("report", "recommendation")
-    workflow.add_edge("recommendation", END)
+    workflow.add_edge("report", END)
 
     return workflow.compile()
 
@@ -928,7 +1104,17 @@ def run_research(topic):
 
         "literature": {},
 
+        "source_quality_profiles": [],
+
+        "source_quality_table": "",
+
+        "retraction_warnings": [],
+
         "evidence": [],
+
+        "consensus_profiles": [],
+
+        "consensus_table": "",
 
         "research_round": 0,
 

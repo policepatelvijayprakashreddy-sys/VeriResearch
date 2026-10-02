@@ -108,6 +108,7 @@ def normalize_academic_result(
     year=None,
     doi="",
     source="",
+    venue="",
 ):
     """
     Convert academic search results into
@@ -139,6 +140,12 @@ def normalize_academic_result(
         ),
 
         "source": source,
+
+        "venue": (
+            venue.strip()
+            if venue
+            else ""
+        ),
     }
 
 
@@ -186,10 +193,9 @@ def remove_duplicates(
             .lower()
         )
 
-        title = result.get(
-            "title",
-            ""
-        )
+        title = (result.get("title") or "").strip()
+        if not title or title.lower() in ("untitled", "unknown title", "none", "no title"):
+            continue
 
         # ----------------------------------------------------
         # DOI DUPLICATE
@@ -522,6 +528,8 @@ def search_semantic_scholar(
                 doi=doi,
 
                 source="Semantic Scholar",
+
+                venue=paper.get("venue", "") or "",
             )
         )
 
@@ -712,13 +720,21 @@ def search_crossref(
             title = titles[0]
 
         # ----------------------------------------------------
-        # ABSTRACT
+        # ABSTRACT & XML CLEANING
         # ----------------------------------------------------
 
-        abstract = item.get(
+        raw_abstract = item.get(
             "abstract",
             ""
         )
+        abstract = re.sub(r"<[^>]+>", "", raw_abstract).strip() if raw_abstract else ""
+
+        # ----------------------------------------------------
+        # VENUE (container-title)
+        # ----------------------------------------------------
+
+        container_titles = item.get("container-title", [])
+        venue = container_titles[0].strip() if container_titles and isinstance(container_titles, list) else ""
 
         # ----------------------------------------------------
         # RESULT
@@ -746,6 +762,8 @@ def search_crossref(
                 ),
 
                 source="Crossref",
+
+                venue=venue,
             )
         )
 

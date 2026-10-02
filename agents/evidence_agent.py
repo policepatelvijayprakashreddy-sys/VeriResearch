@@ -64,20 +64,13 @@ Sources:
 Extract only evidence directly supported by the source content.
 For each useful source, provide:
 
-- source_id: use the source identifier shown in the source information
-- source_title: use the source title
-- source_url: use the exact source URL shown in the source information
-- evidence: the relevant supported evidence
-- claim: one concise claim supported by that evidence
-
-For every evidence item, preserve the exact
-URL of the source that supports the evidence.
+- source_id: MUST strictly be the exact SOURCE_ID (e.g. source_1, source_2) corresponding to the CONTENT where the quote was taken.
+- source_title: the source title
+- source_url: the exact source URL
+- evidence: MUST be an exact quote or verbatim passage copied directly from CONTENT. Do not paraphrase or use titles as evidence.
+- claim: a clear, concise claim (at least 6 words) supported by that evidence. Never leave blank.
 
 Do not create or modify URLs.
-
-The source_url must exactly match one of
-the URLs provided in the source information.
-
 Do not invent facts, sources, authors, dates, statistics, or conclusions.
 Do not include evidence that is not present in the supplied source content.
 """

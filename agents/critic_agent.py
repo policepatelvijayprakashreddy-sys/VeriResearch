@@ -27,9 +27,10 @@ class CriticOutput(BaseModel):
 
     follow_up_query: str = Field(
         description=(
-            "A specific search query for "
-            "the next research round, "
-            "if more research is required."
+            "A concise search query of 3 to 6 keywords for "
+            "the next research round, if more research is required. "
+            "Must be short keywords only, NO full sentences, "
+            "NO parentheses, and NO quotes."
         )
     )
 
@@ -42,7 +43,10 @@ def critic_agent(
     research_result,
     literature_analysis,
     literature_sources,
-    evidence=None
+    evidence=None,
+    source_quality_table="",
+    retraction_warnings=None,
+    consensus_table="",
 ):
     """Evaluate research quality and decide whether more research is needed."""
 
@@ -84,6 +88,10 @@ def critic_agent(
     if not evidence_information:
         evidence_information = "NO EXTRACTED EVIDENCE WAS FOUND."
 
+    retraction_alert_text = "\n".join(f"- {w}" for w in (retraction_warnings or []))
+    if not retraction_alert_text:
+        retraction_alert_text = "No retracted papers were detected."
+
     # =========================================
     # CRITIC PROMPT
     # =========================================
@@ -104,14 +112,28 @@ LITERATURE ANALYSIS:
 ACTUAL LITERATURE SOURCES:
 {source_information}
 
+SOURCE QUALITY & RETRACTION AUDIT:
+{source_quality_table or 'No source quality audit available.'}
+
+RETRACTION ALERTS:
+{retraction_alert_text}
+
 EXTRACTED EVIDENCE:
 {evidence_information}
+
+CROSS-PAPER SCIENTIFIC CONSENSUS AUDIT:
+{consensus_table or 'No cross-paper consensus audit available.'}
 
 
 Evaluate the research carefully.
 
 
-## 1. SOURCE QUALITY
+## 1. SOURCE QUALITY & RETRACTIONS
+
+Review the Source Quality & Retraction Audit above:
+- If ANY paper is flagged as RETRACTED, treat its claims as invalid and recommend more research if critical gaps remain.
+- Check whether sources are verified in official registries (DOI, ISSN, PubMed, DOAJ).
+- Distinguish between peer-reviewed journal papers and unvetted preprints.
 
 For each literature source determine whether it appears
 to be:
@@ -156,12 +178,12 @@ Consider:
 Identify important topics that still need investigation.
 
 
-## 5. CONTRADICTIONS
+## 5. SCIENTIFIC CONSENSUS & CONTRADICTIONS
 
-Identify contradictions between sources only when
-they are actually supported by the provided information.
-
-Do not invent contradictions.
+Review the Cross-Paper Scientific Consensus Audit:
+- Distinguish between a missing information gap and a GENUINE SCIENTIFIC DISAGREEMENT (MIXED_EVIDENCE).
+- If the consensus verdict is MIXED_EVIDENCE, this indicates legitimate conflicting empirical findings across the literature under differing conditions. Do NOT request MORE_RESEARCH simply because literature evidence is mixed; report the nuance and differing scopes.
+- Identify contradictions between sources only when they are actually supported by the provided information. Do not invent contradictions.
 
 
 ## 6. SHOULD MORE RESEARCH BE PERFORMED?
@@ -224,7 +246,7 @@ If the decision is SUFFICIENT:
 If the decision is MORE_RESEARCH:
 
 - knowledge_gap must identify one specific missing research area
-- follow_up_query must be a specific search query that investigates that gap
+- follow_up_query must be a concise keyword query of 3 to 6 keywords (e.g. 'UAV localization CNN architectures'). Do NOT write a full sentence. Do NOT use parentheses, quotes, or boolean operators (AND/OR).
 
 Do not invent facts.
 Do not invent sources.

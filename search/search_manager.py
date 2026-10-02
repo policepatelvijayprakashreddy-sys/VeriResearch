@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 
 import requests
@@ -15,6 +16,157 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Domains that provide lexical definitions, course platforms, shopping, or generic non-research noise
+JUNK_DOMAINS = [
+    # Dictionary / thesaurus
+    "merriam-webster.com",
+    "dictionary.cambridge.org",
+    "vocabulary.com",
+    "wiktionary.org",
+    "thesaurus.com",
+    "collinsdictionary.com",
+    "dictionary.com",
+    "definitions.net",
+    "urbandictionary.com",
+    # E-commerce & shopping
+    "amazon.com",
+    "amazon.co.uk",
+    "amazon.in",
+    "amazon.de",
+    "ebay.com",
+    "ebay.co.uk",
+    "walmart.com",
+    "homedepot.com",
+    "lowes.com",
+    "etsy.com",
+    "alibaba.com",
+    "aliexpress.com",
+    "target.com",
+    "bestbuy.com",
+    "wayfair.com",
+    # Wikis / fandom / general encyclopaedia noise
+    "fandom.com",
+    "wikia.com",
+    # Social media & video
+    "youtube.com",
+    "youtu.be",
+    "facebook.com",
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "tiktok.com",
+    "pinterest.com",
+    "linkedin.com",
+    # Q&A / forum
+    "quora.com",
+    "reddit.com",
+    "stackoverflow.com",
+    "stackexchange.com",
+    # Course platforms (ads)
+    "udemy.com",
+    "coursera.org",
+    "edx.org",
+    "skillshare.com",
+    "pluralsight.com",
+    # Model / dataset hubs (not peer-reviewed)
+    "ollama.com",
+    "huggingface.co",
+    # Content farms & marketing blogs (not research)
+    "hostinger.com",
+    "simplilearn.com",
+    "vocal.media",
+    "tutorialspoint.com",
+    "javatpoint.com",
+    "w3schools.com",
+    "geeksforgeeks.org",
+    # Generic news / tabloids
+    "buzzfeed.com",
+    "huffpost.com",
+]
+
+# Words that indicate a shopping page, generic info page, or non-research noise
+JUNK_TITLE_PATTERNS = [
+    # Dictionary / language
+    "definition & meaning",
+    "definition and meaning",
+    "english meaning",
+    "meaning & pronunciation",
+    "how to use in a sentence",
+    "synonyms & antonyms",
+    "translation in",
+    # Shopping / commercial
+    "shop through",
+    "free shipping",
+    "buy online",
+    "for sale",
+    "best price",
+    "add to cart",
+    "create a course",
+    # Fandom / game wikis
+    "| fandom",
+    "wiki | fandom",
+    # E-commerce terms in title
+    "customer reviews",
+    "deals & discounts",
+    "lowest price",
+    "free delivery",
+    "in stock",
+    "order now",
+]
+
+# Single-word generic Wikipedia pages that are often mistakenly returned when DDG truncates
+JUNK_WIKI_SLUGS = {
+    "comparison", "error", "bias", "test", "definition",
+    "overview", "survey", "chain", "network", "model", "system",
+    "tool", "tools", "product", "products", "item", "items"
+}
+
+
+from urllib.parse import urlparse
+
+ADULT_DOMAINS = [
+    "xhamster", "pornhub", "xvideos", "xnxx", "redtube",
+    "youporn", "chaturbate", "spankbang", "beeg", "tube8"
+]
+
+
+def _domain_matches(netloc: str, target: str) -> bool:
+    netloc = netloc.lower()
+    target = target.lower()
+    return netloc == target or netloc.endswith("." + target)
+
+
+def is_junk_result(url: str, title: str = "", content: str = "") -> bool:
+    """Return True if URL, title, or content indicates an e-commerce page, dictionary, course ad, or adult/generic noise."""
+    url_lower = url.lower()
+    title_lower = title.lower()
+    content_lower = content.lower() if content else ""
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+
+    # Block adult sites immediately
+    if any(ad in host or ad in url_lower for ad in ADULT_DOMAINS):
+        return True
+
+    # Match junk domains by exact host or domain suffix (e.g., prevents "linux.com" matching "x.com")
+    if any(_domain_matches(host, d) for d in JUNK_DOMAINS):
+        return True
+
+    if any(pattern in title_lower for pattern in JUNK_TITLE_PATTERNS):
+        return True
+
+    # Check for obvious e-commerce / shopping content snippets
+    if any(pattern in content_lower for pattern in ["add to cart", "buy now", "free shipping on orders", "customer ratings"]):
+        return True
+
+    if "wikipedia.org/wiki/" in url_lower:
+        slug = url_lower.split("wikipedia.org/wiki/")[-1].strip("/").lower()
+        if slug in JUNK_WIKI_SLUGS:
+            return True
+
+    return False
 
 
 # ============================================
@@ -52,12 +204,12 @@ def normalize_result(result):
 
 
 # ============================================
-# REMOVE DUPLICATES
+# REMOVE DUPLICATES AND JUNK
 # ============================================
 
 def remove_duplicates(results):
     """
-    Remove duplicate results using URLs.
+    Remove duplicate results and filter out dictionary/junk sites.
     """
 
     unique = []
@@ -74,6 +226,15 @@ def remove_duplicates(results):
         if not url:
             continue
 
+        title = result.get("title", "")
+
+        content = result.get("content", "")
+
+        # Drop dictionary entries, course spam, and junk domains
+        if is_junk_result(url, title, content):
+            logger.debug("[Search Manager] Dropping junk result: %s (%s)", title, url)
+            continue
+
         if url in seen_urls:
             continue
 
@@ -88,23 +249,55 @@ def remove_duplicates(results):
 # CLEAN QUERY
 # ============================================
 
-def clean_query(query):
+def clean_query(query: str, max_terms: int = 7) -> str:
     """
-    Clean an LLM-generated search query before
-    sending it to the search provider.
+    Clean and optimize an LLM-generated search query before
+    sending it to DuckDuckGo or SearXNG.
+
+    1. Removes prefixes like 'QUERY:', 'Search query:'.
+    2. Strips boolean operators (AND, OR, NOT) and complex punctuation.
+    3. Strips parentheses, brackets, and quotes that break search parsers.
+    4. Limits query terms to max_terms (e.g. 7) to avoid keyword truncation.
     """
+    if not query:
+        return ""
 
     query = query.strip()
 
-    # Remove wrapping quotation marks
-    if (
-        len(query) >= 2
-        and query.startswith('"')
-        and query.endswith('"')
-    ):
-        query = query[1:-1].strip()
+    # Strip conversational prefixes
+    for prefix in ["QUERY:", "Query:", "SEARCH QUERY:", "Search query:", "Search:", "GAP:"]:
+        if query.startswith(prefix):
+            query = query[len(prefix):].strip()
 
-    return query
+    # Remove quotes
+    query = query.strip('"\'`')
+
+    # Remove boolean operators that confuse simple search engines
+    query = re.sub(r"\b(AND|OR|NOT)\b", " ", query)
+
+    # Remove parentheses, brackets, braces, colons, semicolons, question marks, commas
+    query = re.sub(r"[()\[\]{}:;?,\n\r]", " ", query)
+
+    # Collapse whitespace
+    query = re.sub(r"\s+", " ", query).strip()
+
+    # If query is too long, strip stop words and keep the top technical keywords
+    words = query.split()
+    if len(words) > max_terms:
+        STOP_WORDS = {
+            "a", "an", "the", "and", "or", "of", "for", "in", "on", "at", "to",
+            "from", "by", "with", "about", "into", "through", "during", "is", "are",
+            "was", "were", "what", "which", "how", "why", "investigate", "investigating",
+            "explore", "exploring", "study", "studying", "understanding", "comparison",
+            "comparing", "different", "various"
+        }
+        filtered = [w for w in words if w.lower() not in STOP_WORDS]
+        if len(filtered) >= 3:
+            query = " ".join(filtered[:max_terms])
+        else:
+            query = " ".join(words[:max_terms])
+
+    return query.strip()
 
 
 # ============================================
@@ -131,7 +324,8 @@ def _search_once(
 
             search_results = ddgs.text(
                 query,
-                max_results=max_results
+                max_results=max_results,
+                safesearch="on",
             )
 
             for result in search_results:
@@ -284,7 +478,9 @@ def search(
     if SEARCH_CACHE_ENABLED:
         cached = get_cached(query, max_results)
         if cached is not None:
-            return cached
+            clean_cached = remove_duplicates(cached)
+            if clean_cached:
+                return clean_cached
 
     for attempt in range(
         1,

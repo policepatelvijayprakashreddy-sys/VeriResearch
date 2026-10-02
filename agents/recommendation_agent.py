@@ -181,6 +181,25 @@ def _format_sources(web_sources: list, academic_sources: list, gap_sources: list
     return "\n\n".join(sections) if sections else "No sources available."
 
 
+def _token_jaccard(a: str, b: str) -> float:
+    import re
+    sa = set(re.findall(r"\w+", (a or "").lower()))
+    sb = set(re.findall(r"\w+", (b or "").lower()))
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _is_valid_rec(r: ResearchRecommendation, source_titles: list) -> bool:
+    gap_words = (r.gap or "").split()
+    app_words = (r.approach or "").split()
+    if len(gap_words) < 8 or "Novelty =" in r.gap or "Difficulty =" in r.gap or len(app_words) < 8:
+        return False
+    if any(_token_jaccard(r.title, t) > 0.65 for t in source_titles if t):
+        return False
+    return True
+
+
 # ============================================================
 # MAIN RECOMMENDATION AGENT
 # ============================================================
@@ -255,19 +274,15 @@ that are UNDER-EXPLORED or represent genuine GAPS in the current literature.
 Rules:
 - Ground each recommendation in the provided sources where possible.
 - Do NOT recommend topics that are already extensively covered.
-- Avoid generic suggestions like "more research is needed on X".
-- Each recommendation must be specific enough that a research team
-  could begin work on it with a clear methodology.
-- novelty = HIGH means this is a genuinely new direction with few publications.
-- novelty = LOW means it is an incremental but still valuable extension.
-- difficulty = STARTER means achievable in a few months by a small team.
-- difficulty = ADVANCED means a multi-year research programme.
+- Do NOT copy the exact title of an existing paper in the sources as a project title.
+- gap: MUST be a 2–3 sentence technical explanation of why this specific problem is unsolved (e.g., lack of sensor datasets, computational complexity, unverified assumptions). Do NOT repeat metadata strings like 'Novelty = HIGH' in the gap field.
+- approach: MUST be a 2–3 sentence technical methodology explaining how a researcher should solve the problem.
+- DIVERSE METHODOLOGIES: Ensure the recommended projects use varied technical approaches (e.g., benchmark suite construction, formal verification, architectural ablation, security red-teaming, or empirical system evaluation).
+- DIVERSE COMPLEXITY: Include at least one ADVANCED multi-year technical project, at least one INTERMEDIATE, and at least one STARTER project.
+- novelty: HIGH (genuinely new direction), MEDIUM (significant advance), LOW (incremental extension).
+- difficulty: STARTER (few months), INTERMEDIATE (6-12 months), ADVANCED (multi-year).
 
-Also write a 2–3 sentence landscape_summary explaining the current state
-of research on this topic and why these gaps exist.
-
-Do not invent citations or statistics.
-If information is not available from the sources, acknowledge uncertainty.
+Also write a 2–3 sentence landscape_summary explaining the current state of research on this topic and why these gaps exist.
 """
 
     # ── 3. Structured LLM call ───────────────────────────────
@@ -284,8 +299,12 @@ If information is not available from the sources, acknowledge uncertainty.
 
     try:
         result = structured_llm.invoke(prompt)
+        all_titles = [s.get("title", "") for s in (literature_sources + web_sources + gap_sources) if s.get("title")]
+        valid_recs = [r for r in result.recommendations if _is_valid_rec(r, all_titles)]
+        result.recommendations = valid_recs
         logger.info(
-            "[Recommendation] Generated %d recommendations.",
+            "[Recommendation] Generated %d valid recommendations (out of %d raw).",
+            len(valid_recs),
             len(result.recommendations)
         )
         return result

@@ -24,3 +24,5 @@ python-dotenv>=1.0
 # NLI model running locally on CPU
 transformers>=4.40
 torch>=2.0
+# ── Terminal UI & Formatting ─────────────────────────────
+rich>=13.0

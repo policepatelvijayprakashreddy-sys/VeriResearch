@@ -9,3 +9,6 @@ reports/*.md
 
 # Runtime data
 data/
+*.log
+*.zip
+create_zip.py
