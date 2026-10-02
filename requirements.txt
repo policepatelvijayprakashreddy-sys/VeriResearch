@@ -1,28 +1,33 @@
+# ============================================================
 # VeriResearch — AI Research Agent
-# Install with: pip install -r requirements.txt
+# Installation: pip install -r requirements.txt
+# ============================================================
 
-# ── LLM & Agent Framework ─────────────────────────────────
-langchain-core>=0.3
-langchain-ollama>=0.3
-langgraph>=0.6
+# ── LLM & Multi-Agent Orchestration ─────────────────────────
+langchain-core>=0.3.0
+langchain-ollama>=0.3.0
+langgraph>=0.6.0
 
-# ── Pydantic (structured outputs) ─────────────────────────
-pydantic>=2.0
+# ── Structured Outputs & Data Validation ────────────────────
+pydantic>=2.0.0
 
-# ── Search ────────────────────────────────────────────────
-# DuckDuckGo Search (primary web search provider)
-ddgs>=8.0
+# ── Web & Academic Search Providers ─────────────────────────
+# DuckDuckGo search integration (via ddgs / duckduckgo-search)
+ddgs>=8.0.0
+duckduckgo_search>=7.0.0
 
-# HTTP requests (SearXNG fallback, Semantic Scholar, Crossref)
-requests>=2.32
+# HTTP requests for OpenAlex, Crossref & SearXNG API endpoints
+requests>=2.31.0
 
-# ── Utilities ─────────────────────────────────────────────
-# Load .env files automatically
-python-dotenv>=1.0
+# ── NLI Verification & Machine Learning ─────────────────────
+# DeBERTa-v3 Natural Language Inference running locally on CPU/GPU
+transformers>=4.40.0
+torch>=2.0.0
+huggingface-hub>=0.20.0
+numpy>=1.24.0
 
-# ── Verification Agent ────────────────────────────────────
-# NLI model running locally on CPU
-transformers>=4.40
-torch>=2.0
-# ── Terminal UI & Formatting ─────────────────────────────
-rich>=13.0
+# ── Terminal UI, Logging & Progress Formatting ──────────────
+rich>=13.0.0
+
+# ── Environment & Utilities ─────────────────────────────────
+python-dotenv>=1.0.0
