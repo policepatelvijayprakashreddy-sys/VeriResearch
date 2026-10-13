@@ -31,7 +31,7 @@ import logging
 import os
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 
 from pydantic import BaseModel, Field
 
@@ -177,10 +177,44 @@ def _count_citations(report_text: str) -> int:
     return len(re.findall(r'\[\d+\]', body))
 
 
-def _citation_coverage(citation_count: int, evidence_count: int) -> float:
-    if evidence_count == 0:
-        return 0.0
-    return min(citation_count / evidence_count, 1.0)
+def _extract_citation_audit_counts(report_text: str, source_count: int = 100) -> tuple[int, int]:
+    """
+    Extract (cited_candidates, eligible_candidates) from the report's
+    Citation Integrity Audit section if present, or compute them using
+    _audit_citations from agents.report_agent as a fallback.
+    """
+    m_cand = re.search(r"Eligible factual-claim candidates:\s*(\d+)", report_text)
+    m_cited = re.search(r"Candidates with at least one registered citation:\s*(\d+)", report_text)
+    if m_cand and m_cited:
+        return int(m_cited.group(1)), int(m_cand.group(1))
+
+    try:
+        from agents.report_agent import _audit_citations
+        audit = _audit_citations(report_text, source_count=max(source_count, 1))
+        eligible = audit.get("eligible_sentences") or audit.get("eligible_claims", 0)
+        cited = audit.get("cited_sentences") or audit.get("cited_claims", 0)
+        return cited, eligible
+    except Exception as err:
+        logger.warning("[Eval] Citation audit fallback failed: %s", err)
+        return 0, 0
+
+
+def _citation_coverage(
+    report_text_or_cited: Any,
+    eligible_candidates: Optional[int] = None,
+    source_count: int = 100,
+) -> float:
+    """
+    Fraction of eligible narrative sentences (sections 1-7) that carry a registered [n] citation.
+    Uses sentence-level audit from _audit_citations in agents.report_agent.
+    Supports either _citation_coverage(report_text) or _citation_coverage(cited, eligible).
+    """
+    if isinstance(report_text_or_cited, (int, float)) and isinstance(eligible_candidates, (int, float)):
+        return float(report_text_or_cited) / float(eligible_candidates) if eligible_candidates > 0 else 0.0
+
+    report_text = str(report_text_or_cited or "")
+    cited, eligible = _extract_citation_audit_counts(report_text, source_count=source_count)
+    return cited / eligible if eligible > 0 else 0.0
 
 
 def _evidence_density(evidence_count: int, report_text: str) -> float:
@@ -344,7 +378,8 @@ def run_eval(
 
     citation_count   = _count_citations(report_text)
     evidence_count   = len(evidence)
-    cov              = _citation_coverage(citation_count, evidence_count)
+    total_sources    = len(web_sources) + len(academic_srcs)
+    cov              = _citation_coverage(report_text, source_count=total_sources)
 
     web_count        = len(web_sources)
     acad_count       = len(academic_srcs)
@@ -440,7 +475,10 @@ def format_eval_summary(report: EvalReport) -> str:
         f"  Evidence   : {report.evidence_item_count} items "
         f"({report.evidence_density} per 1k words)\n"
         f"  Gap noted  : {gap_status}\n"
-        f"  Contradiction Rate : {f'{report.hallucination_rate*100:.1f}%' if report.hallucination_rate is not None else 'N/A'}\n"
+        f"  Unsupported or contradicted: "
+        f"{report.hallucination_rate * 100:.1f}%\n"
+        if report.hallucination_rate is not None
+        else "  Unsupported or contradicted: N/A\n"
         f"  {judge_str}Overall: {report.overall_score}/10\n"
         f"{'='*60}"
     )
@@ -484,7 +522,8 @@ def save_eval_report(report: EvalReport, reports_dir: str) -> str:
         f"| Evidence items | {report.evidence_item_count} |",
         f"| Evidence density (per 1k words) | {report.evidence_density} |",
         f"| Knowledge gap acknowledged | {'Yes ✅' if report.gap_acknowledged else 'No ❌'} |",
-        f"| NLI Hallucination Rate | {f'{report.hallucination_rate*100:.1f}%' if report.hallucination_rate is not None else 'Unverified'} |",
+        "| Unsupported or contradicted rate | "
+        f"{f'{report.hallucination_rate * 100:.1f}%' if report.hallucination_rate is not None else 'N/A'} |",
     ]
 
     if report.llm_judge:

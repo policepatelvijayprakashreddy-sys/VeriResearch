@@ -148,38 +148,68 @@ def _journal_similarity(j1: str, j2: str) -> float:
     return _token_similarity(j1, j2)
 
 
-def _author_overlap(authors_a: list, authors_b: list) -> bool:
-    """
-    Check if at least one author surname/family name matches.
-    Returns True if either list is empty (no penalty for missing author data).
-    """
+def _author_overlap(authors_a: list, authors_b: list):
+    """Return True for a match, False for a mismatch, None if unknown."""
     if not authors_a or not authors_b:
-        return True
+        return None
 
-    def _extract_family_names(auth_list):
+    def family_names(authors):
         names = set()
-        for item in auth_list:
+        for item in authors:
             if isinstance(item, str):
-                parts = [p.strip().lower() for p in item.split() if len(p.strip()) > 1]
-                if parts:
-                    names.add(parts[-1])
-            elif isinstance(item, dict):
-                fam = item.get("family") or item.get("name") or ""
-                if fam:
-                    names.add(fam.strip().lower())
+                if "," in item:
+                    fam_part = item.split(",")[0].strip().lower()
+                    if fam_part:
+                        names.add(fam_part.split()[-1])
                 else:
-                    disp = item.get("display_name") or ""
-                    parts = [p.strip().lower() for p in disp.split() if len(p.strip()) > 1]
+                    parts = item.strip().lower().split()
                     if parts:
                         names.add(parts[-1])
+            elif isinstance(item, dict):
+                family = item.get("family")
+                if family:
+                    names.add(str(family).strip().lower())
+                else:
+                    display = item.get("display_name") or item.get("name") or ""
+                    if "," in display:
+                        fam_part = display.split(",")[0].strip().lower()
+                        if fam_part:
+                            names.add(fam_part.split()[-1])
+                    else:
+                        parts = str(display).strip().lower().split()
+                        if parts:
+                            names.add(parts[-1])
         return names
 
-    names_a = _extract_family_names(authors_a)
-    names_b = _extract_family_names(authors_b)
+    names_a = family_names(authors_a)
+    names_b = family_names(authors_b)
 
     if not names_a or not names_b:
-        return True
+        return None
+
+    # A first-author mismatch is a strong identity warning.
+    if authors_a and authors_b:
+        first_a = family_names([authors_a[0]])
+        first_b = family_names([authors_b[0]])
+        if first_a and first_b and not (first_a & first_b):
+            return False
+
     return bool(names_a & names_b)
+
+
+def _resolve_identity_status(profile: dict) -> str:
+    """Separate identity-verification outcome from confidence level."""
+    if profile.get("is_retracted"):
+        return "RETRACTED"
+    if profile.get("identity_conflict", False):
+        return "IDENTITY_MISMATCH"
+    confidence = profile.get("identity_confidence", "LOW")
+    agreement = profile.get("metadata_agreement", "N/A")
+    if confidence == "HIGH" and agreement == "HIGH":
+        return "VERIFIED"
+    if confidence == "MEDIUM":
+        return "PROVISIONAL"
+    return "UNVERIFIED"
 
 
 # ============================================================
@@ -379,6 +409,21 @@ def verify_single_paper(paper: dict) -> dict:
     cached_profile = _get_cached_data("profile", paper_cache_key)
     if cached_profile is not None:
         logger.debug("[Quality] Profile Cache HIT for: %s", paper_cache_key[:40])
+        # Re-evaluate strong_identity exemption on cached profiles so updated rules take effect
+        doi_in_both = (cached_profile.get("openalex_status") == "VERIFIED" and cached_profile.get("crossref_status") == "VERIFIED")
+        if (
+            cached_profile.get("title_similarity", 0.0) >= 0.80
+            and cached_profile.get("authors_match") is True
+            and doi_in_both
+        ):
+            cached_profile["identity_conflict"] = False
+            if cached_profile.get("metadata_agreement") == "MISMATCH":
+                cached_profile["metadata_agreement"] = "MODERATE"
+            if cached_profile.get("identity_confidence") == "LOW":
+                cached_profile["identity_confidence"] = "MEDIUM"
+                cached_profile["confidence_level"] = "MEDIUM"
+
+        cached_profile["identity_status"] = _resolve_identity_status(cached_profile)
         return cached_profile
 
     # Base profile structure
@@ -406,6 +451,10 @@ def verify_single_paper(paper: dict) -> dict:
         "identity_confidence": "LOW",
         "confidence_level": "LOW",
         "confidence_reason": "No DOI or metadata record found.",
+        "identity_status": "UNVERIFIED",
+        "identity_conflict": False,
+        "authors_match": None,
+        "journal_match": None,
     }
 
     # Case 2: Handle arXiv preprints directly (Skip Crossref)
@@ -424,6 +473,7 @@ def verify_single_paper(paper: dict) -> dict:
             "confidence_level": "MEDIUM",
             "confidence_reason": "Authentic preprint, but not formally peer-reviewed.",
         })
+        profile["identity_status"] = _resolve_identity_status(profile)
         _set_cached_data("profile", paper_cache_key, profile)
         return profile
 
@@ -434,6 +484,7 @@ def verify_single_paper(paper: dict) -> dict:
             "identity_confidence": "LOW",
             "confidence_level": "LOW",
         })
+        profile["identity_status"] = _resolve_identity_status(profile)
         _set_cached_data("profile", paper_cache_key, profile)
         return profile
 
@@ -487,6 +538,7 @@ def verify_single_paper(paper: dict) -> dict:
             "journal_name": (oa_meta or cr_meta or {}).get("journal_name", paper_venue),
             "issn": (oa_meta or cr_meta or {}).get("issn", ""),
         })
+        profile["identity_status"] = _resolve_identity_status(profile)
         _set_cached_data("profile", paper_cache_key, profile)
         return profile
 
@@ -540,23 +592,75 @@ def verify_single_paper(paper: dict) -> dict:
 
     best_paper_sim = max(sim_paper_oa, sim_paper_cr)
     profile["title_similarity"] = round(best_paper_sim, 3)
-    profile["title_matched"] = best_paper_sim >= 0.50
+    profile["title_matched"] = best_paper_sim >= 0.75
 
     # Authors overlap
-    authors_match = True
+    authors_match = None
     if oa_meta and cr_meta:
         authors_match = _author_overlap(oa_meta["authors"], cr_meta["authors"])
+
     if paper_authors:
-        if oa_meta and not _author_overlap(paper_authors, oa_meta["authors"]):
-            authors_match = False
-        if cr_meta and not _author_overlap(paper_authors, cr_meta["authors"]):
-            authors_match = False
+        if oa_meta:
+            oa_overlap = _author_overlap(paper_authors, oa_meta["authors"])
+            if oa_overlap is False:
+                authors_match = False
+            elif oa_overlap is True and authors_match is not False:
+                authors_match = True
+        if cr_meta:
+            cr_overlap = _author_overlap(paper_authors, cr_meta["authors"])
+            if cr_overlap is False:
+                authors_match = False
+            elif cr_overlap is True and authors_match is not False:
+                authors_match = True
+    else:
+        # Missing author metadata for the input paper cannot qualify for positive match
+        if authors_match is not False:
+            authors_match = None
 
     # Journal / Venue match
-    journal_match = True
-    if oa_meta and cr_meta and oa_meta["journal_name"] and cr_meta["journal_name"]:
-        j_sim = _journal_similarity(oa_meta["journal_name"], cr_meta["journal_name"])
-        journal_match = (j_sim >= 0.55)
+    journal_match = None
+    # Treat venues containing 'ebook' as platform names to skip false-positive venue comparisons
+    is_ebook_platform = any(
+        "ebook" in str(v).lower()
+        for v in [
+            (oa_meta or {}).get("journal_name", ""),
+            (cr_meta or {}).get("journal_name", ""),
+            paper_venue
+        ]
+    )
+
+    if (
+        oa_meta
+        and cr_meta
+        and oa_meta.get("journal_name")
+        and cr_meta.get("journal_name")
+        and paper_venue
+        and paper_venue.lower() not in ("unknown", "none", "")
+        and not is_ebook_platform
+    ):
+        j_sim = _journal_similarity(
+            oa_meta["journal_name"],
+            cr_meta["journal_name"],
+        )
+        journal_match = j_sim >= 0.55
+
+    doi_verified_in_both = (oa_status == "VERIFIED" and cr_status == "VERIFIED")
+    strong_identity = (
+        best_paper_sim >= 0.80
+        and authors_match is True
+        and doi_verified_in_both
+    )
+
+    profile["authors_match"] = authors_match
+    profile["journal_match"] = journal_match
+    profile["identity_conflict"] = (
+        authors_match is False
+        or ((journal_match is False) and not strong_identity)
+        or (
+            (oa_meta is not None or cr_meta is not None)
+            and best_paper_sim < 0.70
+        )
+    )
 
     # ========================================================
     # 4. IDENTITY CONFIDENCE SYNTHESIS
@@ -564,11 +668,17 @@ def verify_single_paper(paper: dict) -> dict:
 
     # SCENARIO A: Both OpenAlex and Crossref verified the DOI
     if oa_status == "VERIFIED" and cr_status == "VERIFIED":
-        dual_registry_agrees = (sim_oa_cr >= 0.80)
-        paper_matches_registry = (best_paper_sim >= 0.70)
-        moderate_paper_match = (best_paper_sim >= 0.50)
+        dual_registry_agrees = (sim_oa_cr >= 0.85)
+        paper_matches_registry = (best_paper_sim >= 0.80)
+        moderate_paper_match = (best_paper_sim >= 0.70)
 
-        if dual_registry_agrees and paper_matches_registry and journal_match and authors_match:
+        # HIGH requires positive evidence for all three checks.
+        if (
+            dual_registry_agrees
+            and paper_matches_registry
+            and authors_match is True
+            and journal_match is True
+        ):
             profile["metadata_agreement"] = "HIGH"
             profile["identity_confidence"] = "HIGH"
             profile["confidence_level"] = "HIGH"
@@ -576,7 +686,12 @@ def verify_single_paper(paper: dict) -> dict:
                 f"Dual verification confirmed (OpenAlex + Crossref). "
                 f"Metadata substantially agrees (Title sim: {sim_oa_cr:.2f}, Journal confirmed)."
             )
-        elif moderate_paper_match and (dual_registry_agrees or sim_oa_cr >= 0.60):
+        elif (
+            moderate_paper_match
+            and (dual_registry_agrees or sim_oa_cr >= 0.60)
+            and authors_match is not False
+            and (journal_match is not False or strong_identity)
+        ):
             profile["metadata_agreement"] = "MODERATE"
             profile["identity_confidence"] = "MEDIUM"
             profile["confidence_level"] = "MEDIUM"
@@ -596,7 +711,7 @@ def verify_single_paper(paper: dict) -> dict:
     # SCENARIO B: OpenAlex verified, Crossref unavailable / timeout / rate limited
     elif oa_status == "VERIFIED" and cr_status in ("TIMEOUT", "UNAVAILABLE", "RATE_LIMITED"):
         profile["metadata_agreement"] = "SINGLE_SOURCE (Crossref unavailable)"
-        if sim_paper_oa >= 0.70:
+        if sim_paper_oa >= 0.70 and authors_match is not False and journal_match is not False:
             profile["identity_confidence"] = "MEDIUM"
             profile["confidence_level"] = "MEDIUM"
             profile["confidence_reason"] = (
@@ -606,13 +721,13 @@ def verify_single_paper(paper: dict) -> dict:
             profile["identity_confidence"] = "LOW"
             profile["confidence_level"] = "LOW"
             profile["confidence_reason"] = (
-                f"DOI found in OpenAlex, but title similarity low ({sim_paper_oa:.2f}) and Crossref was {cr_status.lower()}."
+                f"DOI found in OpenAlex, but title similarity low ({sim_paper_oa:.2f}) or metadata conflicts, and Crossref was {cr_status.lower()}."
             )
 
     # SCENARIO C: Crossref verified, OpenAlex unavailable / timeout / rate limited
     elif cr_status == "VERIFIED" and oa_status in ("TIMEOUT", "UNAVAILABLE", "RATE_LIMITED"):
         profile["metadata_agreement"] = "SINGLE_SOURCE (OpenAlex unavailable)"
-        if sim_paper_cr >= 0.70:
+        if sim_paper_cr >= 0.70 and authors_match is not False and journal_match is not False:
             profile["identity_confidence"] = "MEDIUM"
             profile["confidence_level"] = "MEDIUM"
             profile["confidence_reason"] = (
@@ -622,20 +737,20 @@ def verify_single_paper(paper: dict) -> dict:
             profile["identity_confidence"] = "LOW"
             profile["confidence_level"] = "LOW"
             profile["confidence_reason"] = (
-                f"DOI found in Crossref, but title similarity low ({sim_paper_cr:.2f}) and OpenAlex was {oa_status.lower()}."
+                f"DOI found in Crossref, but title similarity low ({sim_paper_cr:.2f}) or metadata conflicts, and OpenAlex was {oa_status.lower()}."
             )
 
     # SCENARIO D: One verified, other NOT_FOUND
     elif (oa_status == "VERIFIED" and cr_status == "NOT_FOUND") or (cr_status == "VERIFIED" and oa_status == "NOT_FOUND"):
         profile["metadata_agreement"] = "SINGLE_SOURCE (Registry discrepancy)"
-        if best_paper_sim >= 0.70:
+        if best_paper_sim >= 0.70 and authors_match is not False and journal_match is not False:
             profile["identity_confidence"] = "MEDIUM"
             profile["confidence_level"] = "MEDIUM"
             profile["confidence_reason"] = "DOI confirmed in one scholarly registry, but record absent in the second."
         else:
             profile["identity_confidence"] = "LOW"
             profile["confidence_level"] = "LOW"
-            profile["confidence_reason"] = "DOI found in only one registry with weak title agreement."
+            profile["confidence_reason"] = "DOI found in only one registry with weak title agreement or metadata mismatch."
 
     # SCENARIO E: Neither provider found the DOI (Both 404)
     elif oa_status == "NOT_FOUND" and cr_status == "NOT_FOUND":
@@ -653,6 +768,7 @@ def verify_single_paper(paper: dict) -> dict:
             f"Verification services unreachable (OpenAlex: {oa_status}, Crossref: {cr_status})."
         )
 
+    profile["identity_status"] = _resolve_identity_status(profile)
     _set_cached_data("profile", paper_cache_key, profile)
     return profile
 

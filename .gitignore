@@ -13,9 +13,15 @@ reports/*.md
 !reports/20261002_170246_AI_in_automobile_eval.md
 !reports/20261002_160518_uav_localisation.md
 !reports/20261002_160556_uav_localisation_eval.md
+!reports/20261013_093011_Security_vulnerabilities_in_LLM-generated_code.md
+!reports/20261013_093049_Security_vulnerabilities_in_LLM-generated_code_eval.md
+!reports/20261013_100455_Deep_learning_for_diabetic_retinopathy_detection_from_fundus.md
+!reports/20261013_100538_Deep_learning_for_diabetic_retinopathy_detection_from_fundus_eval.md
 
 # Runtime data
 data/
 *.log
 *.zip
 create_zip.py
+scratch/
+

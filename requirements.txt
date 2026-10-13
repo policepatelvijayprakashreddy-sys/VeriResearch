@@ -31,3 +31,8 @@ rich>=13.0.0
 
 # ── Environment & Utilities ─────────────────────────────────
 python-dotenv>=1.0.0
+
+# ── PDF to Structured Markdown ─────────────────────────────
+pymupdf4llm>=0.0.17
+pymupdf>=1.24.0
+

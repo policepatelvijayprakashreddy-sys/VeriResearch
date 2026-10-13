@@ -124,6 +124,29 @@ def _load_nli_pipeline():
         return None
 
 
+def _make_verification_result(
+    item: dict,
+    label: str,
+    confidence: Optional[float],
+) -> dict:
+    """Preserve evidence provenance through verification."""
+    return {
+        "source_id": item.get("source_id", ""),
+        "source_key": item.get("source_key", ""),
+        "evidence_id": item.get("evidence_id", ""),
+        "claim": item.get("claim", ""),
+        "evidence": item.get("evidence", ""),
+        "source_url": item.get("source_url", ""),
+        "source_title": item.get("source_title", ""),
+        "label": label,
+        "confidence": (
+            round(confidence, 3)
+            if confidence is not None
+            else None
+        ),
+    }
+
+
 # ============================================================
 # VERIFY A SINGLE CLAIM
 # ============================================================
@@ -140,11 +163,11 @@ def _verify_one(
     Returns
     -------
     (label, confidence)
-        label      : ENTAILMENT | NEUTRAL | CONTRADICTION
+        label      : ENTAILMENT | NEUTRAL | CONTRADICTION | UNVERIFIED
         confidence : float 0.0-1.0 for the winning label
     """
     if not evidence.strip() or not claim.strip():
-        return NEUTRAL, None
+        return UNVERIFIED, None
 
     try:
         out = pipe(
@@ -207,14 +230,13 @@ def verification_agent(
             "Marking all claims as UNVERIFIED."
         )
         for item in evidence_items:
-            results.append({
-                "claim":        item.get("claim", ""),
-                "evidence":     item.get("evidence", ""),
-                "source_url":   item.get("source_url", ""),
-                "source_title": item.get("source_title", ""),
-                "label":        UNVERIFIED,
-                "confidence":   None,
-            })
+            results.append(
+                _make_verification_result(
+                    item=item,
+                    label=UNVERIFIED,
+                    confidence=None,
+                )
+            )
         return _build_summary(results)
 
     pipe = _load_nli_pipeline()
@@ -222,14 +244,13 @@ def verification_agent(
     if pipe is None:
         # Graceful fallback — transformers not installed
         for item in evidence_items:
-            results.append({
-                "claim":        item.get("claim", ""),
-                "evidence":     item.get("evidence", ""),
-                "source_url":   item.get("source_url", ""),
-                "source_title": item.get("source_title", ""),
-                "label":        UNVERIFIED,
-                "confidence":   None,
-            })
+            results.append(
+                _make_verification_result(
+                    item=item,
+                    label=UNVERIFIED,
+                    confidence=None,
+                )
+            )
         return _build_summary(results)
 
     logger.info(
@@ -245,14 +266,13 @@ def verification_agent(
             claim, evidence, pipe, config.NLI_CONFIDENCE_THRESHOLD
         )
 
-        results.append({
-            "claim":        claim,
-            "evidence":     evidence,
-            "source_url":   item.get("source_url", ""),
-            "source_title": item.get("source_title", ""),
-            "label":        label,
-            "confidence":   round(conf, 3) if conf is not None else None,
-        })
+        results.append(
+            _make_verification_result(
+                item=item,
+                label=label,
+                confidence=conf,
+            )
+        )
 
         logger.debug(
             "[Verification] [%d/%d] %s (conf=%.2f): %s",
@@ -282,54 +302,96 @@ def verification_agent(
 
 def _build_summary(results: list) -> dict:
     total = len(results)
+
     if total == 0:
         return _empty_summary()
 
-    entailment_count    = sum(1 for r in results if r["label"] == ENTAILMENT)
-    neutral_count       = sum(1 for r in results if r["label"] == NEUTRAL)
-    contradiction_count = sum(1 for r in results if r["label"] == CONTRADICTION)
-    unverified_count    = sum(1 for r in results if r["label"] == UNVERIFIED)
+    entailment_count = sum(
+        1 for r in results if r.get("label") == ENTAILMENT
+    )
+    neutral_count = sum(
+        1 for r in results if r.get("label") == NEUTRAL
+    )
+    contradiction_count = sum(
+        1 for r in results if r.get("label") == CONTRADICTION
+    )
+    unverified_count = sum(
+        1 for r in results if r.get("label") == UNVERIFIED
+    )
 
-    verified = total - unverified_count
+    # Only claims with an actual NLI classification are in this denominator.
+    checked_count = entailment_count + neutral_count + contradiction_count
 
-    # Scientific calibration:
-    # Grounded: source directly entails the derived claim
-    # Unsupported: source snippet alone does not provide sufficient proof (neutral)
-    # Contradicted / Hallucinated: source text directly refutes the claim
-    grounded_rate      = entailment_count    / verified if verified > 0 else None
-    unsupported_rate   = neutral_count       / verified if verified > 0 else None
-    contradiction_rate = contradiction_count / verified if verified > 0 else None
-    # For backward compatibility with eval harnesses
-    hallucination_rate = contradiction_rate
+    grounded_rate = (
+        entailment_count / checked_count if checked_count else None
+    )
+    unsupported_rate = (
+        neutral_count / checked_count if checked_count else None
+    )
+    contradiction_rate = (
+        contradiction_count / checked_count if checked_count else None
+    )
+    unsupported_or_contradicted_rate = (
+        (neutral_count + contradiction_count) / checked_count
+        if checked_count else None
+    )
 
     return {
-        "results":             results,
-        "entailment_count":    entailment_count,
-        "grounded_count":      entailment_count,
-        "neutral_count":       neutral_count,
-        "unsupported_count":   neutral_count,
+        "results": results,
+        "total": total,
+        "checked_count": checked_count,
+        "unverified_count": unverified_count,
+
+        "entailment_count": entailment_count,
+        "grounded_count": entailment_count,
+        "neutral_count": neutral_count,
+        "unsupported_count": neutral_count,
         "contradiction_count": contradiction_count,
-        "unverified_count":    unverified_count,
-        "total":               total,
-        "entailment_rate":     round(grounded_rate,      3) if grounded_rate      is not None else None,
-        "grounded_rate":       round(grounded_rate,      3) if grounded_rate      is not None else None,
-        "neutral_rate":        round(unsupported_rate,   3) if unsupported_rate   is not None else None,
-        "unsupported_rate":    round(unsupported_rate,   3) if unsupported_rate   is not None else None,
-        "contradiction_rate":  round(contradiction_rate, 3) if contradiction_rate is not None else None,
-        "hallucination_rate":  round(hallucination_rate, 3) if hallucination_rate is not None else None,
+
+        "entailment_rate": (
+            round(grounded_rate, 3) if grounded_rate is not None else None
+        ),
+        "grounded_rate": (
+            round(grounded_rate, 3) if grounded_rate is not None else None
+        ),
+        "neutral_rate": (
+            round(unsupported_rate, 3) if unsupported_rate is not None else None
+        ),
+        "unsupported_rate": (
+            round(unsupported_rate, 3) if unsupported_rate is not None else None
+        ),
+        "contradiction_rate": (
+            round(contradiction_rate, 3)
+            if contradiction_rate is not None else None
+        ),
+
+        # Legacy metric retained for compatibility. It now counts both
+        # neutral and contradicted claims, so it is not a confirmed
+        # hallucination rate.
+        "hallucination_rate": (
+            round(unsupported_or_contradicted_rate, 3)
+            if unsupported_or_contradicted_rate is not None else None
+        ),
+        "unsupported_or_contradicted_rate": (
+            round(unsupported_or_contradicted_rate, 3)
+            if unsupported_or_contradicted_rate is not None else None
+        ),
     }
 
 
 def _empty_summary() -> dict:
     return {
         "results": [],
+        "checked_count": 0,
         "entailment_count": 0, "grounded_count": 0,
         "neutral_count": 0, "unsupported_count": 0,
         "contradiction_count": 0, "unverified_count": 0,
         "total": 0,
         "entailment_rate": None, "grounded_rate": None,
         "neutral_rate": None, "unsupported_rate": None,
-        "contradiction_rate": None, "hallucination_rate": None,
+        "contradiction_rate": None,
+        "hallucination_rate": None,
+        "unsupported_or_contradicted_rate": None,
     }
 
 

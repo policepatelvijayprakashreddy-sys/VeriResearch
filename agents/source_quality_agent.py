@@ -34,8 +34,8 @@ def format_quality_table(profiles: list, citation_map: dict = None) -> str:
         return "No academic sources were available for quality auditing."
 
     lines = [
-        "| # | Paper Title | OpenAlex | Crossref | Retraction Status | Journal / Venue | ISSN | Identity Verification |",
-        "|---|-------------|----------|----------|-------------------|-----------------|------|-----------------------|",
+        "| # | Paper Title | OpenAlex | Crossref | Retraction Status | Journal / Venue | ISSN | Title Match | Metadata Agreement | Identity Status | Identity Confidence |",
+        "|---|-------------|----------|----------|-------------------|-----------------|------|-------------|--------------------|-----------------|---------------------|",
     ]
 
     for i, p in enumerate(profiles, start=1):
@@ -95,8 +95,32 @@ def format_quality_table(profiles: list, citation_map: dict = None) -> str:
         else:
             conf_badge = "⚪ LOW"
 
+        stat = p.get("identity_status", "UNVERIFIED")
+        if stat == "VERIFIED":
+            stat_badge = "🟢 VERIFIED"
+        elif stat == "PROVISIONAL":
+            stat_badge = "🟡 PROVISIONAL"
+        elif stat == "IDENTITY_MISMATCH":
+            stat_badge = "🔴 MISMATCH"
+        elif stat == "RETRACTED":
+            stat_badge = "🔴 RETRACTED"
+        else:
+            stat_badge = "⚪ UNVERIFIED"
+
+        title_similarity = p.get("title_similarity", 0.0)
+        title_match = p.get("title_matched", False)
+        metadata_agreement = p.get("metadata_agreement", "N/A")
+        title_badge = (
+            f"✅ Match ({title_similarity:.2f})"
+            if title_match
+            else f"⚠️ Review ({title_similarity:.2f})"
+        )
+        metadata_text = str(metadata_agreement).replace("|", "/").replace("\n", " ")
+
         lines.append(
-            f"| {cit_label} | {title} | {oa_badge} | {cr_badge} | {retraction_status} | {venue} | `{issn}` | {conf_badge} |"
+            f"| {cit_label} | {title} | {oa_badge} | {cr_badge} | "
+            f"{retraction_status} | {venue} | `{issn}` | "
+            f"{title_badge} | {metadata_text} | {stat_badge} | {conf_badge} |"
         )
 
     lines.append("\n*> **Note on Scopus / Web of Science:** Not independently verified by our system (requires institutional enterprise API credentials).*")
@@ -145,6 +169,15 @@ def source_quality_agent(literature_sources: list) -> dict:
         source["confidence_level"] = source["identity_confidence"]
         source["verified_indexes"] = profile.get("indexed_in", [])
         source["citation_count"] = profile.get("citation_count", 0)
+        source["title_similarity"] = profile.get("title_similarity", 0.0)
+        source["title_matched"] = profile.get("title_matched", False)
+        source["metadata_agreement"] = profile.get("metadata_agreement", "N/A")
+        source["identity_confidence_reason"] = profile.get("confidence_reason", "")
+        source["verified_publisher"] = profile.get("publisher", "")
+        source["retraction_details"] = profile.get("retraction_details", "")
+        source["identity_status"] = profile.get("identity_status", "UNVERIFIED")
+        source["authors_match"] = profile.get("authors_match")
+        source["journal_match"] = profile.get("journal_match")
 
         if profile.get("is_retracted"):
             warning = f"CRITICAL: Paper '[{source.get('title')}]' (DOI: {source.get('doi')}) has been officially RETRACTED."

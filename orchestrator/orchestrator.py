@@ -1,4 +1,5 @@
 import logging
+import re
 import warnings
 from typing import TypedDict, Any
 
@@ -19,7 +20,11 @@ from langgraph.graph import StateGraph, START, END
 from agents.research_agent import research_agent
 from agents.literature_agent import literature_agent
 from agents.source_quality_agent import source_quality_agent
-from agents.evidence_agent import extract_evidence
+from agents.evidence_agent import (
+    extract_evidence,
+    _stable_source_key,
+    _stable_evidence_id,
+)
 from agents.critic_agent import critic_agent
 from agents.report_agent import report_agent
 from agents.recommendation_agent import (
@@ -366,6 +371,12 @@ def literature_node(state: ResearchState):
             source
         )
 
+    # Filter out supplementary files (e.g. /mm1 attachments or .pdf titles)
+    unique_sources = [
+        s for s in unique_sources
+        if not (s.get("url", "").lower().endswith("/mm1") or s.get("title", "").lower().endswith(".pdf"))
+    ]
+
     # --------------------------------------------------------
     # Relevance Pre-Filter (Drops off-topic keyword false-positives)
     # --------------------------------------------------------
@@ -474,6 +485,132 @@ def evidence_in_source(evidence: str, source: dict, min_ratio: float = 0.70) -> 
     return (m.size / len(ev)) >= min_ratio
 
 
+_CUES = re.compile(
+    r"\b(we (propose|present|show|find|found|demonstrate|introduce|conclude|observe|evaluate)"
+    r"|our (results|findings|approach|framework|analysis|study)"
+    r"|results (show|indicate|reveal|suggest)"
+    r"|this (paper|study|work) (proposes|presents|shows|finds|examines)"
+    r"|in conclusion|outperform\w*|significantly)\b", re.I)
+
+
+def _key_passages(text, max_sentences=12, max_chars=3500):
+    """Keep the sentences most likely to state the paper's findings, in original order."""
+    text = re.split(r"\n#+\s*(?:references|bibliography)\b", text, flags=re.I)[0]
+    sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", text))
+    scored = [(len(_CUES.findall(s)), i, s) for i, s in enumerate(sentences) if 40 < len(s) < 400]
+    top = sorted(scored, key=lambda x: (-x[0], x[1]))[:max_sentences]
+    top = [t for t in top if t[0] > 0] or top[:max_sentences]
+    out = " ".join(s for _, _, s in sorted(top, key=lambda x: x[1]))
+    return out[:max_chars]
+
+
+def _fetch_full_text(doi, timeout=20):
+    import io, requests, config
+    doi = (doi or "").replace("https://doi.org/", "").strip()
+    if not doi:
+        return ""
+    text = ""
+
+    # 1. CORE: plain full text, no PDF parsing
+    key = getattr(config, "CORE_API_KEY", "")
+    if key:
+        try:
+            r = requests.get("https://api.core.ac.uk/v3/search/works",
+                             params={"q": f'doi:"{doi}"', "limit": 1},
+                             headers={"Authorization": f"Bearer {key}"}, timeout=timeout)
+            if r.status_code == 200:
+                text = ((r.json().get("results") or [{}])[0]).get("fullText") or ""
+        except Exception:
+            pass
+
+    # 2. Unpaywall open-access PDF -> markdown
+    if len(text) < 2000:
+        try:
+            email = getattr(config, "CONTACT_EMAIL", "research-agent@example.com")
+            oa = requests.get(f"https://api.unpaywall.org/v2/{doi}",
+                              params={"email": email}, timeout=timeout).json()
+            pdf_url = (oa.get("best_oa_location") or {}).get("url_for_pdf")
+            if pdf_url:
+                r = requests.get(pdf_url, timeout=timeout)
+                if r.status_code == 200 and "pdf" in r.headers.get("content-type", "").lower():
+                    import pymupdf, pymupdf4llm
+                    doc = pymupdf.open(stream=r.content, filetype="pdf")
+                    text = pymupdf4llm.to_markdown(doc)
+        except Exception:
+            pass
+
+    return _key_passages(text) if len(text) > 2000 else ""
+
+
+def _fetch_openalex_abstract(doi, timeout=8):
+    """Rebuild a paper's abstract from OpenAlex's inverted index. Returns '' if unavailable."""
+    import requests
+    doi = (doi or "").replace("https://doi.org/", "").strip()
+    if not doi:
+        return ""
+    try:
+        r = requests.get(
+            f"https://api.openalex.org/works/doi:{doi}",
+            params={"select": "abstract_inverted_index"},
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            return ""
+        inv = r.json().get("abstract_inverted_index") or {}
+        words = {pos: w for w, positions in inv.items() for pos in positions}
+        return " ".join(words[i] for i in sorted(words))
+    except Exception:
+        return ""
+
+
+def filter_relevant_sources(sources: list, topic: str, min_keyword_matches: int = 1) -> list:
+    """
+    Filter sources to keep only those relevant to the research topic.
+    Drops sources with zero meaningful topic keywords in their title/content.
+    If all sources would be dropped, returns the original list as a safety fallback.
+    """
+    if not sources or not topic:
+        return sources
+
+    STOP_FILTER = {
+        "a", "an", "the", "in", "on", "of", "and", "for", "with", "to", "at",
+        "by", "from", "is", "are", "via", "using", "as", "system", "study",
+        "paper", "while", "how", "what", "which", "into", "their", "this",
+        "that", "over", "under", "between", "when"
+    }
+    topic_keywords = {
+        w for w in re.findall(r"[a-z0-9]{3,}", topic.lower())
+        if w not in STOP_FILTER
+    }
+    if not topic_keywords:
+        return sources
+
+    relevant = []
+    for s in sources:
+        text = f"{s.get('title', '')} {s.get('content', '')}".lower()
+        match_count = sum(1 for w in topic_keywords if w in text)
+        threshold = min(min_keyword_matches, len(topic_keywords))
+        if match_count >= threshold:
+            relevant.append(s)
+        else:
+            logger.info(
+                "[Relevance Filter] Dropping off-topic source (%d/%d topic keywords matched): %s",
+                match_count, len(topic_keywords), s.get("title", "")[:60]
+            )
+
+    if not relevant:
+        logger.warning(
+            "[Relevance Filter] All sources flagged as off-topic; keeping original sources as fallback."
+        )
+        return sources
+
+    logger.info(
+        "[Relevance Filter] Retained %d/%d topic-relevant sources.",
+        len(relevant), len(sources)
+    )
+    return relevant
+
+
 # ============================================================
 # EVIDENCE NODE
 # ============================================================
@@ -503,6 +640,27 @@ def evidence_node(state: ResearchState):
         web_sources
         + literature_sources
     )
+
+    for s in literature_sources:
+        if s.get("doi"):
+            full_text = _fetch_full_text(s["doi"])
+            if full_text:
+                s["content"] = full_text
+                s["text_origin"] = "full_text"
+                continue
+
+        if len((s.get("content") or "").strip()) < 200 and s.get("doi"):
+            abstract = _fetch_openalex_abstract(s["doi"])
+            if abstract:
+                s["content"] = abstract
+                s["text_origin"] = "openalex_abstract"
+        elif s.get("content"):
+            s["text_origin"] = "search_abstract"
+        else:
+            s["text_origin"] = "none"
+
+    # Pre-filter all sources for research topic relevance before evidence extraction
+    all_sources = filter_relevant_sources(all_sources, topic)
 
     source_records = {
         f"source_{index}": source
@@ -571,8 +729,13 @@ def evidence_node(state: ResearchState):
                 )
                 continue
 
+            source_key = getattr(item, "source_key", "") or _stable_source_key(source)
+            evidence_id = getattr(item, "evidence_id", "") or _stable_evidence_id(source_key, evidence_text, claim_text)
+
             evidence_items.append({
                 "source_id": source_id,
+                "source_key": source_key,
+                "evidence_id": evidence_id,
                 "source_title": source.get(
                     "title",
                     item.source_title
@@ -1068,7 +1231,8 @@ def _build_graph():
         }
     )
 
-    workflow.add_edge("report", END)
+    workflow.add_edge("report", "recommendation")
+    workflow.add_edge("recommendation", END)
 
     return workflow.compile()
 

@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
 from agents.verification_agent import _load_nli_pipeline, _verify_one, ENTAILMENT, CONTRADICTION, NEUTRAL
+from agents.evidence_agent import _stable_source_key, _stable_evidence_id
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,32 @@ STOP_WORDS = {
     "more", "most", "than", "or", "not", "no", "also", "both", "all", "any", "some",
     "show", "shows", "demonstrate", "demonstrates", "finding", "findings", "study", "paper"
 }
+
+
+# ============================================================
+# SOURCE NORMALIZATION FOR DEDUPLICATION
+# ============================================================
+
+def _normalize_identifier(source: dict) -> str:
+    """Normalize DOI, URL, or title into a canonical source identifier for deduplication."""
+    doi = (source.get("doi") or "").strip().lower()
+    if not doi:
+        url_raw = (source.get("url") or source.get("source_url") or "").strip()
+        doi_match = re.search(r"doi\.org/(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", url_raw, re.IGNORECASE)
+        if doi_match:
+            doi = doi_match.group(1).lower()
+
+    if doi:
+        doi = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", doi).strip().rstrip("/")
+        if doi:
+            return f"doi:{doi}"
+
+    url = (source.get("url") or source.get("source_url") or "").strip().lower().rstrip("/")
+    if url:
+        return f"url:{url}"
+    title = (source.get("title") or source.get("source_title") or "").strip().lower()
+    clean_title = " ".join(re.findall(r"\w+", title))
+    return f"title:{clean_title}"
 
 
 # ============================================================
@@ -70,11 +97,12 @@ def _lexical_prefilter(claim_keywords: set, text: str, min_overlap: int = 2) -> 
 def _find_best_passage(claim_keywords: set, content: str, max_chars: int = 500) -> str:
     """
     Find the most relevant passage/sentence in content matching claim keywords.
+    Only searches actual content text (never titles alone).
     """
-    if not content:
+    if not content or not content.strip():
         return ""
     # Split content into sentences/chunks
-    sentences = re.split(r"(?<=[.!?])\s+", content)
+    sentences = re.split(r"(?<=[.!?])\s+", content.strip())
     best_sent = ""
     best_score = -1
 
@@ -92,7 +120,7 @@ def _find_best_passage(claim_keywords: set, content: str, max_chars: int = 500) 
         return best_sent
     elif best_sent:
         return best_sent[:max_chars] + "..."
-    return content[:max_chars]
+    return content.strip()[:max_chars]
 
 
 # ============================================================
@@ -131,70 +159,88 @@ def is_claim_relevant_to_topic(claim: str, topic: str = "") -> bool:
     return True
 
 
-def select_core_claims(evidence_items: list, verification_results: list, max_claims: int = 5, topic: str = "") -> list:
+def select_core_claims(
+    evidence_items: list,
+    verification_results: list,
+    max_claims: int = 5,
+    topic: str = "",
+) -> list:
     """
     Select top 3-5 core empirical claims for cross-paper consensus evaluation.
-    Prioritizes claims verified as ENTAILMENT during Stage 1 grounding and ensures topic relevance.
+    Only selects evidence items whose specific verification result is ENTAILMENT.
+    Does not admit NEUTRAL, CONTRADICTION, or UNVERIFIED items.
+    If none qualify, returns an empty list.
     """
-    if not evidence_items:
+    if not evidence_items or not verification_results:
         return []
 
-    # Map verified status
-    verified_map = {}
-    for res in verification_results or []:
-        claim_text = (res.get("claim") or "").strip()
-        if claim_text:
-            verified_map[claim_text] = res.get("label")
+    def _norm(c):
+        return " ".join((c or "").strip().lower().split())
 
-    # Sort items: filter by topic relevance, prioritize ENTAILMENT, then others
+    # Map verified status by evidence_id, (source_key, claim), and claim
+    verif_by_ev_id = {}
+    verif_by_src_claim = {}
+    verif_by_claim = {}
+
+    for res in verification_results or []:
+        ev_id = res.get("evidence_id")
+        src_key = res.get("source_key")
+        claim_norm = _norm(res.get("claim"))
+
+        if ev_id:
+            verif_by_ev_id[ev_id] = res
+        if src_key and claim_norm:
+            verif_by_src_claim[(src_key, claim_norm)] = res
+        if claim_norm:
+            verif_by_claim[claim_norm] = res
+
     grounded_items = []
-    other_items = []
 
     for item in evidence_items:
-        claim_text = (item.get("claim") or "").strip()
-        if not claim_text:
-            continue
-        if not is_claim_relevant_to_topic(claim_text, topic):
-            logger.debug("[Consensus Agent] Filtered out off-topic / noisy claim: %s", claim_text)
+        claim_raw = (item.get("claim") or "").strip()
+        if not claim_raw:
             continue
 
-        label = verified_map.get(claim_text)
-        if label == ENTAILMENT:
-            grounded_items.append(item)
-        else:
-            other_items.append(item)
+        item_ev_id = item.get("evidence_id")
+        item_src_key = item.get("source_key")
+        claim_norm = _norm(claim_raw)
 
-    candidate_items = grounded_items if grounded_items else other_items
+        # Match verification result by evidence_id, (source_key, claim), then claim
+        matched_verif = None
+        if item_ev_id and item_ev_id in verif_by_ev_id:
+            matched_verif = verif_by_ev_id[item_ev_id]
+        elif item_src_key and (item_src_key, claim_norm) in verif_by_src_claim:
+            matched_verif = verif_by_src_claim[(item_src_key, claim_norm)]
+        elif claim_norm in verif_by_claim:
+            matched_verif = verif_by_claim[claim_norm]
 
-    # Safe fallback if strict topic keyword overlap filtered all items
-    if not candidate_items:
-        logger.info("[Consensus Agent] Strict topic filter yielded 0 claims; applying clean non-commercial fallback.")
-        candidate_items = [
-            i for i in evidence_items
-            if (i.get("claim") or "").strip()
-            and not COMMERCIAL_NOISE_PATTERN.search(i.get("claim", ""))
-        ]
+        if not matched_verif or matched_verif.get("label") != ENTAILMENT:
+            # Strictly reject NEUTRAL, CONTRADICTION, UNVERIFIED, or unverified items
+            continue
+
+        if not is_claim_relevant_to_topic(claim_raw, topic):
+            logger.debug("[Consensus Agent] Filtered out off-topic / noisy claim: %s", claim_raw)
+            continue
+
+        # Attach matched verification metadata to the item
+        item_copy = dict(item)
+        item_copy["verification_label"] = matched_verif.get("label")
+        item_copy["verification_confidence"] = matched_verif.get("confidence")
+        grounded_items.append(item_copy)
+
+    if not grounded_items:
+        # Strictly return empty list: no fallbacks to unverified, neutral, or contradictory items
+        return []
 
     # Deduplicate similar claims
     selected = []
-    for item in candidate_items:
+    for item in grounded_items:
         claim = item.get("claim", "")
-        # Check if too similar to an already selected claim
         if any(_token_jaccard(claim, sel.get("claim", "")) >= 0.70 for sel in selected):
             continue
         selected.append(item)
         if len(selected) >= max_claims:
             break
-
-    # If still below max_claims, pull from remaining items
-    if len(selected) < max_claims:
-        for item in other_items:
-            claim = item.get("claim", "")
-            if any(_token_jaccard(claim, sel.get("claim", "")) >= 0.70 for sel in selected):
-                continue
-            selected.append(item)
-            if len(selected) >= max_claims:
-                break
 
     return selected
 
@@ -214,11 +260,18 @@ def evaluate_claim_consensus(
     """
     if threshold is None:
         threshold = config.NLI_CONFIDENCE_THRESHOLD
+
     claim = (claim_item.get("claim") or "").strip()
     origin_url = (claim_item.get("source_url") or "").strip()
     origin_title = (claim_item.get("source_title") or "Originating Source").strip()
     origin_evidence = (claim_item.get("evidence") or "").strip()
     origin_venue = (claim_item.get("venue") or "").strip()
+    origin_verif_label = claim_item.get("verification_label") or claim_item.get("label")
+    origin_verif_conf = claim_item.get("verification_confidence") or claim_item.get("confidence")
+
+    origin_canonical_id = _normalize_identifier(claim_item)
+    origin_source_key = claim_item.get("source_key") or _stable_source_key(claim_item)
+    origin_evidence_id = claim_item.get("evidence_id") or _stable_evidence_id(origin_source_key, origin_evidence, claim)
 
     claim_keywords = _extract_claim_keywords(claim)
 
@@ -230,14 +283,13 @@ def evaluate_claim_consensus(
     origin_retracted = claim_item.get("is_retracted", False)
     if not origin_retracted:
         for s in literature_sources:
-            if (origin_url and s.get("url") and origin_url.lower() == s.get("url", "").lower()) or \
-               (origin_title and s.get("title") and origin_title.lower() == s.get("title", "").lower()):
+            if _normalize_identifier(s) == origin_canonical_id:
                 if s.get("is_retracted"):
                     origin_retracted = True
                     break
 
-    # Include the originating source as supporting if grounded and not retracted
-    if origin_evidence:
+    # Include the originating source as supporting ONLY if grounded (ENTAILMENT) and not retracted
+    if origin_evidence and origin_verif_label == ENTAILMENT:
         if origin_retracted:
             alert = {
                 "title": origin_title,
@@ -245,6 +297,8 @@ def evaluate_claim_consensus(
                 "url": origin_url,
                 "evidence": origin_evidence[:200],
                 "details": "Originating paper was officially RETRACTED in scholarly registries.",
+                "source_key": origin_source_key,
+                "evidence_id": origin_evidence_id,
             }
             retracted_alerts.append(alert)
             logger.warning("[Consensus Alert] Originating paper is RETRACTED: %s", origin_title)
@@ -254,38 +308,57 @@ def evaluate_claim_consensus(
                 "url": origin_url,
                 "venue": origin_venue,
                 "evidence": origin_evidence,
-                "confidence": 1.0,
+                "confidence": round(origin_verif_conf, 3) if origin_verif_conf is not None else None,
                 "is_origin": True,
+                "source_key": origin_source_key,
+                "evidence_id": origin_evidence_id,
+                "source_id": claim_item.get("source_id", ""),
             })
+
+    # Track independent sources already evaluated to prevent duplicate counting
+    seen_independent_sources = set()
 
     # Evaluate across independent literature sources
     for source in literature_sources:
-        s_url = (source.get("url") or "").strip()
+        s_canonical_id = _normalize_identifier(source)
+        s_source_key = source.get("source_key") or _stable_source_key(source)
         s_title = (source.get("title") or "Untitled Paper").strip()
+        s_url = (source.get("url") or "").strip()
         s_venue = source.get("journal_name") or source.get("venue") or ""
-        s_content = source.get("content") or source.get("snippet") or ""
+        s_content = (source.get("content") or source.get("snippet") or "").strip()
         s_retracted = source.get("is_retracted", False)
 
         # Skip if this is the originating source
-        if origin_url and s_url and origin_url.lower() == s_url.lower():
-            continue
-        if origin_title and s_title and origin_title.lower() == s_title.lower():
+        if s_canonical_id == origin_canonical_id or (origin_source_key and s_source_key == origin_source_key):
             continue
 
-        # 1. Lexical Pre-Filter: Does this paper mention relevant concepts?
-        full_text = f"{s_title}. {s_content}"
-        if not _lexical_prefilter(claim_keywords, full_text, min_overlap=2):
+        # Deduplicate independent sources (e.g. duplicate DOI or URL records)
+        if s_canonical_id in seen_independent_sources or (s_source_key and s_source_key in seen_independent_sources):
+            continue
+        seen_independent_sources.add(s_canonical_id)
+        if s_source_key:
+            seen_independent_sources.add(s_source_key)
+
+        # Do not use title as evidence passage: source content MUST be non-empty
+        if not s_content:
             unaddressed.append(s_title)
             continue
 
-        # 2. Extract best focused candidate passage from abstract/body content
-        searchable_text = s_content.strip() if s_content.strip() else full_text
-        candidate_passage = _find_best_passage(claim_keywords, searchable_text)
-        if not candidate_passage:
+        # 1. Lexical Pre-Filter: Does discovery text (title + content) mention relevant concepts?
+        discovery_text = f"{s_title}. {s_content}"
+        if not _lexical_prefilter(claim_keywords, discovery_text, min_overlap=2):
             unaddressed.append(s_title)
             continue
 
-        # 3. Quality / Retraction Check: Handle retracted sources separately
+        # 2. Extract best focused candidate passage STRICTLY from source content (never from title alone)
+        candidate_passage = _find_best_passage(claim_keywords, s_content)
+        if not candidate_passage or not candidate_passage.strip():
+            unaddressed.append(s_title)
+            continue
+
+        s_evidence_id = _stable_evidence_id(s_source_key, candidate_passage, claim)
+
+        # 3. Quality / Retraction Check: Retracted papers are excluded from consensus counts
         if s_retracted:
             alert = {
                 "title": s_title,
@@ -293,6 +366,8 @@ def evaluate_claim_consensus(
                 "url": s_url,
                 "evidence": candidate_passage[:200],
                 "details": "Paper was retracted in scholarly registries; excluded from scientific consensus calculation.",
+                "source_key": s_source_key,
+                "evidence_id": s_evidence_id,
             }
             retracted_alerts.append(alert)
             logger.warning("[Consensus Alert] Retracted paper found in claim audit: %s", s_title)
@@ -312,6 +387,9 @@ def evaluate_claim_consensus(
                 "evidence": candidate_passage,
                 "confidence": round(conf, 3) if conf is not None else None,
                 "is_origin": False,
+                "source_key": s_source_key,
+                "evidence_id": s_evidence_id,
+                "source_id": source.get("source_id", ""),
             })
         elif label == CONTRADICTION:
             contradicting.append({
@@ -321,31 +399,42 @@ def evaluate_claim_consensus(
                 "evidence": candidate_passage,
                 "confidence": round(conf, 3) if conf is not None else None,
                 "is_origin": False,
+                "source_key": s_source_key,
+                "evidence_id": s_evidence_id,
+                "source_id": source.get("source_id", ""),
             })
         else:
             unaddressed.append(s_title)
 
-    # 5. Synthesize Consensus Verdict
+    # 5. Synthesize Consensus Verdict distinguishing originating support from independent corroboration
+    num_origin_sup = len([s for s in supporting if s.get("is_origin", False)])
+    num_independent_sup = len([s for s in supporting if not s.get("is_origin", False)])
+    num_independent_con = len([s for s in contradicting if not s.get("is_origin", False)])
     num_sup = len(supporting)
     num_con = len(contradicting)
-    num_independent = len([s for s in supporting if not s.get("is_origin", False)])
 
-    if num_sup >= 2 and num_con == 0:
+    if num_independent_sup >= 1 and num_con == 0 and num_sup >= 2:
         verdict = "CONSISTENT_SUPPORT"
         badge = "🟢 CONSISTENT_SUPPORT"
-        reason = f"Corroborated by {num_independent} independent academic source(s) with zero contradictory findings."
+        if num_origin_sup >= 1:
+            reason = f"Supported by originating paper and corroborated by {num_independent_sup} independent academic source(s) with zero contradictory findings."
+        else:
+            reason = f"Supported by {num_independent_sup} independent academic source(s) with zero contradictory findings."
     elif num_sup >= 1 and num_con >= 1:
         verdict = "MIXED_EVIDENCE"
         badge = "🟡 MIXED_EVIDENCE"
-        reason = f"Conflicting findings observed across literature: {num_sup} supporting vs {num_con} contradicting source(s)."
+        reason = f"Conflicting findings observed across literature: {num_sup} supporting ({num_independent_sup} independent) vs {num_con} contradicting source(s)."
     elif num_con >= 1 and num_sup == 0:
         verdict = "PREDOMINANTLY_CONTRADICTED"
         badge = "🔴 PREDOMINANTLY_CONTRADICTED"
-        reason = f"Literature contradicts this claim ({num_con} contradictory finding(s))."
+        reason = f"Literature contradicts this claim ({num_con} contradictory finding(s), {num_independent_con} independent)."
     elif num_sup == 1 and num_con == 0:
         verdict = "SINGLE_SOURCE_CLAIM"
         badge = "⚪ SINGLE_SOURCE_CLAIM"
-        reason = "Supported by originating paper, but not corroborated or tested across other retrieved sources."
+        if num_origin_sup >= 1:
+            reason = "Supported by originating paper, but not corroborated or tested across other retrieved sources."
+        else:
+            reason = "Supported by a single literature source, without independent corroboration."
     else:
         verdict = "UNADDRESSED"
         badge = "⚪ UNADDRESSED"
@@ -490,6 +579,17 @@ def consensus_agent(
 
     # Select top 3-5 core empirical claims
     core_claims = select_core_claims(evidence_items, verification_results, max_claims=max_claims, topic=topic)
+    if not core_claims:
+        logger.info("[Consensus Agent] 0 verified claims eligible for consensus evaluation.")
+        return {
+            "profiles": [],
+            "markdown_table": "No verified empirical claims were eligible for cross-paper consensus evaluation.",
+            "mixed_count": 0,
+            "consistent_count": 0,
+            "contradicted_count": 0,
+            "single_source_count": 0,
+        }
+
     logger.info("[Consensus Agent] Auditing cross-paper consensus for %d core claims...", len(core_claims))
 
     if pipe is None and config.ENABLE_VERIFICATION:

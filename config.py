@@ -152,3 +152,10 @@ QUALITY_CACHE_DIR = os.path.join(
 )
 QUALITY_CACHE_TTL_HOURS = int(os.getenv("QUALITY_CACHE_TTL_HOURS", "168"))  # 7 days
 
+# ============================================
+# OPEN-ACCESS FULL-TEXT & PDF EXTRACTION
+# ============================================
+
+CORE_API_KEY = os.getenv("CORE_API_KEY", "")
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", os.getenv("OPENALEX_MAILTO", "research-agent@example.com"))
+
