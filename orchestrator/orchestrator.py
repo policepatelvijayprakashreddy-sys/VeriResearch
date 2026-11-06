@@ -331,8 +331,16 @@ def literature_node(state: ResearchState):
 
     new_sources = literature_sources
 
-    prev_lit_urls = {s.get("url", "").strip().lower() for s in previous_sources if s.get("url")}
-    truly_new_lit = [s for s in new_sources if s.get("url", "").strip().lower() not in prev_lit_urls]
+    prev_lit_identifiers = {
+        s.get("url", "").strip().lower() for s in previous_sources if s.get("url")
+    } | {
+        s.get("doi", "").strip().lower() for s in previous_sources if s.get("doi")
+    }
+    truly_new_lit = [
+        s for s in new_sources
+        if (s.get("url", "").strip().lower() not in prev_lit_identifiers)
+        and (not s.get("doi") or s.get("doi", "").strip().lower() not in prev_lit_identifiers)
+    ]
     new_literature_found = bool(truly_new_lit) if state.get("research_round", 1) > 1 else bool(new_sources)
 
     # --------------------------------------------------------
@@ -428,9 +436,7 @@ def literature_node(state: ResearchState):
             "sources": unique_sources
         },
 
-        "new_literature_found": bool(
-            new_sources
-        )
+        "new_literature_found": new_literature_found
     }
 
 

@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 import requests
 from ddgs import DDGS
@@ -13,6 +14,8 @@ from config import (
     SEARCH_RETRY_DELAY_SECONDS,
     SEARXNG_INSTANCES,
     SEARXNG_TIMEOUT_SECONDS,
+    ACADEMIC_DOMAINS,
+    STRICT_SOURCES,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,7 +64,6 @@ JUNK_DOMAINS = [
     # Q&A / forum
     "quora.com",
     "reddit.com",
-    "stackoverflow.com",
     "stackexchange.com",
     # Course platforms (ads)
     "udemy.com",
@@ -71,7 +73,6 @@ JUNK_DOMAINS = [
     "pluralsight.com",
     # Model / dataset hubs (not peer-reviewed)
     "ollama.com",
-    "huggingface.co",
     # Content farms & marketing blogs (not research)
     "hostinger.com",
     "simplilearn.com",
@@ -123,18 +124,60 @@ JUNK_WIKI_SLUGS = {
 }
 
 
-from urllib.parse import urlparse
-
 ADULT_DOMAINS = [
     "xhamster", "pornhub", "xvideos", "xnxx", "redtube",
     "youporn", "chaturbate", "spankbang", "beeg", "tube8"
 ]
 
+TRUSTED_SUFFIXES = (
+    ".edu", ".gov", ".ac.uk", ".ac.in", ".gov.in", ".edu.au", ".ac.jp",
+    ".mil", ".int", ".europa.eu"
+)
 
-def _domain_matches(netloc: str, target: str) -> bool:
-    netloc = netloc.lower()
+TRUSTED_DOMAINS = {
+    "arxiv.org", "doi.org", "nature.com", "science.org", "sciencedirect.com",
+    "springer.com", "ieee.org", "acm.org", "nih.gov", "who.int", "nist.gov",
+    "biorxiv.org", "medrxiv.org", "wiley.com", "tandfonline.com", "plos.org",
+    "frontiersin.org", "mdpi.com", "openreview.net", "aclanthology.org",
+    "jmlr.org", "owasp.org", "semanticscholar.org", "openalex.org",
+}
+
+ALL_TRUSTED_DOMAINS = set(TRUSTED_DOMAINS) | set(ACADEMIC_DOMAINS)
+
+
+def _domain_matches(host: str, target: str) -> bool:
+    host = host.lower()
     target = target.lower()
-    return netloc == target or netloc.endswith("." + target)
+    return host == target or host.endswith("." + target)
+
+
+def canonical_url(url: str) -> str:
+    """
+    Normalize a URL for deduplication:
+    - Lowercase scheme and hostname (strip ports & credentials).
+    - Strip trailing slash from path.
+    - Remove tracking / marketing parameters (utm_*, ref, gclid, etc.).
+    - Remove URL fragment (#...).
+    """
+    url = url.strip()
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower() or "https"
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return url.lower().rstrip("/")
+        path = parsed.path.rstrip("/") or "/"
+        qs = {
+            k: v
+            for k, v in parse_qs(parsed.query).items()
+            if not k.lower().startswith("utm_") and k.lower() not in ("ref", "source", "fbclid", "gclid")
+        }
+        query = urlencode(qs, doseq=True)
+        return urlunparse((scheme, host, path, parsed.params, query, ""))
+    except Exception:
+        return url.lower().rstrip("/")
 
 
 def is_junk_result(url: str, title: str = "", content: str = "") -> bool:
@@ -144,22 +187,26 @@ def is_junk_result(url: str, title: str = "", content: str = "") -> bool:
     content_lower = content.lower() if content else ""
 
     parsed = urlparse(url)
-    host = parsed.netloc.lower()
-
-    # Block adult sites immediately
-    if any(ad in host or ad in url_lower for ad in ADULT_DOMAINS):
+    host = (parsed.hostname or "").lower()
+    if not host:
         return True
 
-    # Match junk domains by exact host or domain suffix (e.g., prevents "linux.com" matching "x.com")
+    # Check adult sites strictly on hostname to prevent false positives on paths/queries
+    if any(ad in host for ad in ADULT_DOMAINS):
+        return True
+
+    # Match junk domains by exact host or domain suffix
     if any(_domain_matches(host, d) for d in JUNK_DOMAINS):
         return True
 
     if any(pattern in title_lower for pattern in JUNK_TITLE_PATTERNS):
         return True
 
-    # Check for obvious e-commerce / shopping content snippets
-    if any(pattern in content_lower for pattern in ["add to cart", "buy now", "free shipping on orders", "customer ratings"]):
-        return True
+    # E-commerce shopping patterns: check only if not already an institutional/academic source
+    is_trusted = host.endswith(TRUSTED_SUFFIXES) or any(_domain_matches(host, d) for d in ALL_TRUSTED_DOMAINS)
+    if not is_trusted:
+        if any(pattern in content_lower for pattern in ["add to cart", "buy now", "free shipping on orders"]):
+            return True
 
     if "wikipedia.org/wiki/" in url_lower:
         slug = url_lower.split("wikipedia.org/wiki/")[-1].strip("/").lower()
@@ -167,6 +214,32 @@ def is_junk_result(url: str, title: str = "", content: str = "") -> bool:
             return True
 
     return False
+
+
+def source_tier(url: str, title: str = "", content: str = "") -> int:
+    """
+    Assign a trust tier to a search result:
+    Tier 1 = trusted / peer-reviewed / institutional (.edu, .gov, academic registries & publishers).
+    Tier 2 = unknown / general web (usable as unverified context; dropped if STRICT_SOURCES=True).
+    Tier 3 = junk / dropped (e-commerce, dictionary, adult, spam).
+    """
+    if not url:
+        return 3
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return 3
+
+    # Check junk / adult
+    if is_junk_result(url, title, content):
+        return 3
+
+    # Tier 1 check: institutional suffixes or trusted/academic domains
+    if host.endswith(TRUSTED_SUFFIXES) or any(_domain_matches(host, d) for d in ALL_TRUSTED_DOMAINS):
+        return 1
+
+    return 2
 
 
 # ============================================
@@ -177,29 +250,26 @@ def normalize_result(result):
     """
     Convert a DDGS result into the format
     expected by the research agents.
+
+    A ``tier`` field is added so callers can sort or filter by trust level
+    without re-parsing the URL later.
     """
 
-    return {
-        "title": result.get(
-            "title",
+    url = result.get(
+        "href",
+        result.get(
+            "url",
             ""
-        ),
-
-        "url": result.get(
-            "href",
-            result.get(
-                "url",
-                ""
-            )
-        ),
-
-        "content": result.get(
-            "body",
-            result.get(
-                "content",
-                ""
-            )
         )
+    )
+    title = result.get("title", "")
+    content = result.get("body", result.get("content", ""))
+
+    return {
+        "title": title,
+        "url": url,
+        "content": content,
+        "tier": source_tier(url, title, content),
     }
 
 
@@ -210,37 +280,46 @@ def normalize_result(result):
 def remove_duplicates(results):
     """
     Remove duplicate results and filter out dictionary/junk sites.
+
+    Drops Tier 3 (junk / non-research).
+    When STRICT_SOURCES=True, only Tier 1 (academic/institutional) results
+    are kept.  Otherwise Tier 1 and Tier 2 results are retained, tagged with their
+    trust tier so the caller can sort or filter as needed.
+    Deduplication uses canonical URL normalization (strips utm parameters,
+    trailing slashes, and case).
     """
 
     unique = []
-
-    seen_urls = set()
+    seen_canonical = set()
 
     for result in results:
-
-        url = result.get(
-            "url",
-            ""
-        ).strip().lower()
-
+        url = (result.get("url") or result.get("href") or "").strip()
         if not url:
             continue
 
         title = result.get("title", "")
-
         content = result.get("content", "")
 
-        # Drop dictionary entries, course spam, and junk domains
-        if is_junk_result(url, title, content):
-            logger.debug("[Search Manager] Dropping junk result: %s (%s)", title, url)
+        tier = result.get("tier")
+        if tier is None or tier not in (1, 2, 3):
+            tier = source_tier(url, title, content)
+
+        # Drop Tier 3 (junk, spam, adult, course ads)
+        if tier == 3:
+            logger.debug("[Search Manager] Dropping tier-3 junk result: %s (%s)", title, url)
             continue
 
-        if url in seen_urls:
+        # Optionally enforce strict-sources mode (keep only Tier 1)
+        if STRICT_SOURCES and tier > 1:
+            logger.debug("[Search Manager] Dropping tier-%d result (STRICT_SOURCES): %s", tier, url)
             continue
 
-        seen_urls.add(url)
+        canon = canonical_url(url)
+        if not canon or canon in seen_canonical:
+            continue
 
-        unique.append(result)
+        seen_canonical.add(canon)
+        unique.append({**result, "url": url, "tier": tier})
 
     return unique
 
@@ -499,6 +578,10 @@ def search(
             logger.info(
                 "Search Manager found %d unique sources.", len(results)
             )
+
+            # Sort tier-1 (academic/institutional) sources first so the
+            # LLM sees the highest-trust snippets at the top of the context.
+            results.sort(key=lambda r: r.get("tier", 2))
             
             if SEARCH_CACHE_ENABLED:
                 set_cached(query, max_results, results)
@@ -535,7 +618,9 @@ def search(
         logger.info(
             "Search Manager found %d unique sources via SearXNG.", len(results)
         )
-        
+
+        results.sort(key=lambda r: r.get("tier", 2))
+
         if SEARCH_CACHE_ENABLED:
             set_cached(query, max_results, results)
 

@@ -28,7 +28,10 @@ Graceful fallback:
     The pipeline continues without crashing; hallucination_rate is set to None.
 """
 
+import hashlib
 import logging
+import os
+import shelve
 import sys
 from pathlib import Path
 from typing import Optional
@@ -148,8 +151,49 @@ def _make_verification_result(
 
 
 # ============================================================
-# VERIFY A SINGLE CLAIM
+# VERIFY A SINGLE CLAIM OR BATCH
 # ============================================================
+
+def _interpret(
+    out,
+    threshold: float,
+    id2label: Optional[dict] = None,
+) -> tuple[str, Optional[float]]:
+    """Convert raw pipeline scores for one pair into (label, score)."""
+    if out and isinstance(out, dict):
+        out = [out]
+    best = max(out, key=lambda o: o["score"])
+    raw_label = best["label"]
+    label = str(raw_label).upper()
+
+    # Dynamic id2label resolution from model config if available
+    if id2label:
+        mapped = None
+        if raw_label in id2label:
+            mapped = id2label[raw_label]
+        elif str(raw_label).isdigit() and int(raw_label) in id2label:
+            mapped = id2label[int(raw_label)]
+        elif label.startswith("LABEL_"):
+            idx_str = label.split("_")[-1]
+            if idx_str.isdigit():
+                mapped = id2label.get(int(idx_str)) or id2label.get(idx_str)
+        if mapped:
+            label = str(mapped).upper()
+
+    if label not in (ENTAILMENT, NEUTRAL, CONTRADICTION):
+        # cross-encoder/nli-deberta-v3-small id2label:
+        # 0: contradiction, 1: entailment, 2: neutral
+        label_map = {
+            "LABEL_0": CONTRADICTION,
+            "LABEL_1": ENTAILMENT,
+            "LABEL_2": NEUTRAL,
+        }
+        label = label_map.get(label, NEUTRAL)
+
+    if label != NEUTRAL and best["score"] < threshold:
+        return NEUTRAL, best["score"]
+    return label, best["score"]
+
 
 def _verify_one(
     claim: str,
@@ -170,6 +214,8 @@ def _verify_one(
         return UNVERIFIED, None
 
     try:
+        model_cfg = getattr(getattr(pipe, "model", None), "config", None)
+        id2label = getattr(model_cfg, "id2label", None) if model_cfg is not None else None
         out = pipe(
             {"text": evidence[:1024], "text_pair": claim[:256]},
             top_k=None,
@@ -177,25 +223,124 @@ def _verify_one(
         )
         if out and isinstance(out[0], list):
             out = out[0]
-        elif out and isinstance(out, dict):
-            out = [out]
-
-        best = max(out, key=lambda o: o["score"])
-        label = best["label"].upper()
-        if label not in (ENTAILMENT, NEUTRAL, CONTRADICTION):
-            label_map = {
-                "LABEL_0": CONTRADICTION,
-                "LABEL_1": NEUTRAL,
-                "LABEL_2": ENTAILMENT,
-            }
-            label = label_map.get(label, NEUTRAL)
-
-        if label != NEUTRAL and best["score"] < threshold:
-            return NEUTRAL, best["score"]
-        return label, best["score"]
+        return _interpret(out, threshold, id2label=id2label)
     except Exception as e:
         logger.debug("[Verification] NLI failed: %s", e)
         return NEUTRAL, None
+
+
+def _verify_batch(
+    pairs: list[tuple[str, str]],   # [(claim, evidence), ...]
+    pipe,
+    threshold: float,
+    batch_size: int = 16,
+) -> list[tuple[str, Optional[float]]]:
+    """
+    Batched equivalent of calling _verify_one on every pair, preserving original input order.
+    """
+    results: list[tuple[str, Optional[float]]] = [(UNVERIFIED, None)] * len(pairs)
+
+    # Only run valid pairs; sort by length so batches have minimal padding
+    valid = [
+        i for i, (c, e) in enumerate(pairs)
+        if (c or "").strip() and (e or "").strip()
+    ]
+    if not valid:
+        return results
+
+    valid.sort(key=lambda i: len((pairs[i][1] or "")[:1024]) + len((pairs[i][0] or "")[:256]))
+
+    inputs = [
+        {"text": pairs[i][1][:1024], "text_pair": pairs[i][0][:256]}
+        for i in valid
+    ]
+
+    model_cfg = getattr(getattr(pipe, "model", None), "config", None)
+    id2label = getattr(model_cfg, "id2label", None) if model_cfg is not None else None
+
+    try:
+        outs = pipe(inputs, batch_size=batch_size, top_k=None, truncation=True)
+        # Ensure outs matches valid batch format (list of lists or list of dicts)
+        if isinstance(outs, list) and outs and isinstance(outs[0], list) and len(outs) == len(valid):
+            for i, out in zip(valid, outs):
+                results[i] = _interpret(out, threshold, id2label=id2label)
+        elif len(valid) == 1 and isinstance(outs, list):
+            # Single-pair call might return single list of label dicts
+            results[valid[0]] = _interpret(outs, threshold, id2label=id2label)
+        else:
+            # Fall back to per-pair if mock or custom pipe returned unexpected shape
+            for i in valid:
+                results[i] = _verify_one(pairs[i][0], pairs[i][1], pipe, threshold)
+    except Exception as e:
+        logger.warning("[Verification] Batch NLI failed (%s); falling back to per-pair", e)
+        for i in valid:
+            results[i] = _verify_one(pairs[i][0], pairs[i][1], pipe, threshold)
+
+    return results
+
+
+def _cached_batch(
+    pairs: list[tuple[str, str]],
+    pipe,
+    threshold: float,
+    cache_path: Optional[str] = None,
+    batch_size: int = 16,
+) -> list[tuple[str, Optional[float]]]:
+    """
+    Batch NLI with a disk cache (via shelve) so re-runs only compute new pairs.
+    """
+    if not pairs:
+        return []
+
+    if cache_path is None:
+        cache_dir = getattr(
+            config,
+            "NLI_CACHE_DIR",
+            os.path.join(Path(__file__).resolve().parent.parent, "data", "nli_cache"),
+        )
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            pass
+        cache_path = os.path.join(cache_dir, "nli_cache")
+
+    model_name = getattr(config, "NLI_MODEL_NAME", "cross-encoder/nli-deberta-v3-small")
+    pipe_id = getattr(getattr(pipe, "model", None), "name_or_path", getattr(pipe, "__name__", "model"))
+
+    def _pair_key(c: str, e: str) -> str:
+        raw_key = f"{model_name}|{pipe_id}|{threshold:.2f}|{c.strip()}|{(e or '').strip()[:1024]}"
+        return hashlib.sha1(raw_key.encode("utf-8")).hexdigest()
+
+    results: list[Optional[tuple[str, Optional[float]]]] = [None] * len(pairs)
+    todo_indices = []
+
+    try:
+        with shelve.open(cache_path) as db:
+            for i, (claim, evidence) in enumerate(pairs):
+                if not (claim or "").strip() or not (evidence or "").strip():
+                    results[i] = (UNVERIFIED, None)
+                    continue
+                k = _pair_key(claim, evidence)
+                cached_val = db.get(k)
+                if cached_val is not None and isinstance(cached_val, (tuple, list)) and len(cached_val) == 2:
+                    results[i] = (cached_val[0], cached_val[1])
+                else:
+                    todo_indices.append(i)
+
+            if todo_indices:
+                todo_pairs = [pairs[i] for i in todo_indices]
+                computed = _verify_batch(todo_pairs, pipe, threshold, batch_size=batch_size)
+                for i, verdict in zip(todo_indices, computed):
+                    results[i] = verdict
+                    try:
+                        db[_pair_key(pairs[i][0], pairs[i][1])] = verdict
+                    except Exception:
+                        pass
+    except Exception as err:
+        logger.debug("[Verification] Disk cache read/write error (%s); running batch directly", err)
+        return _verify_batch(pairs, pipe, threshold, batch_size=batch_size)
+
+    return [(v if v is not None else (UNVERIFIED, None)) for v in results]
 
 
 # ============================================================
@@ -254,18 +399,21 @@ def verification_agent(
         return _build_summary(results)
 
     logger.info(
-        "[Verification] Verifying %d claims with NLI...",
+        "[Verification] Verifying %d claims with NLI (batch mode)...",
         len(evidence_items)
     )
 
-    for i, item in enumerate(evidence_items):
-        claim    = item.get("claim", "")
-        evidence = item.get("evidence", "")
+    pairs = [
+        (item.get("claim", ""), item.get("evidence", ""))
+        for item in evidence_items
+    ]
+    verdicts = _cached_batch(
+        pairs,
+        pipe,
+        config.NLI_CONFIDENCE_THRESHOLD,
+    )
 
-        label, conf = _verify_one(
-            claim, evidence, pipe, config.NLI_CONFIDENCE_THRESHOLD
-        )
-
+    for i, (item, (label, conf)) in enumerate(zip(evidence_items, verdicts)):
         results.append(
             _make_verification_result(
                 item=item,
@@ -277,7 +425,7 @@ def verification_agent(
         logger.debug(
             "[Verification] [%d/%d] %s (conf=%.2f): %s",
             i + 1, len(evidence_items),
-            label, conf or 0.0, claim[:80]
+            label, conf or 0.0, (item.get("claim") or "")[:80]
         )
 
     summary = _build_summary(results)

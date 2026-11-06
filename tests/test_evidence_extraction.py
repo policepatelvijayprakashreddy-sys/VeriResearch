@@ -68,3 +68,31 @@ def test_stable_evidence_id_deterministic():
     id2 = _stable_evidence_id(src_key, ev, claim)
     assert id1 == id2
     assert id1.startswith("ev_")
+
+
+def test_stable_source_key_from_doi():
+    source = {"doi": "10.1234/EXAMPLE"}
+    key = _stable_source_key(source)
+    assert key.startswith("src_")
+    assert key == _stable_source_key(source)
+
+
+def test_stable_source_key_from_url():
+    source = {"url": "https://example.com/paper"}
+    key = _stable_source_key(source)
+    assert key.startswith("src_")
+    assert key == _stable_source_key(source)
+
+
+def test_stable_source_key_from_title():
+    source = {"title": "Example Research Paper"}
+    key = _stable_source_key(source)
+    assert key.startswith("src_")
+    assert key == _stable_source_key(source)
+
+
+def test_stable_source_key_missing_identifiers():
+    source = {}
+    key = _stable_source_key(source)
+    assert key == ""
+

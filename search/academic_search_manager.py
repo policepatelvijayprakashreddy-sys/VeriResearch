@@ -15,7 +15,17 @@ from config import (
     CROSSREF_MAILTO,
     CROSSREF_MAX_RESULTS,
     CROSSREF_TIMEOUT_SECONDS,
+    OPENALEX_BASE_URL,
+    OPENALEX_MAILTO,
+    OPENALEX_TIMEOUT_SECONDS,
 )
+
+logger = logging.getLogger(__name__)
+
+# Bump this version string whenever the set of providers or their field lists
+# change, so that cached results keyed on the old format are automatically
+# skipped rather than returned incomplete.
+_ACAD_CACHE_VERSION = "v3"  # v1=SS+CR, v2=+OpenAlex, v3=+extra SS fields
 
 
 # ============================================================
@@ -109,6 +119,9 @@ def normalize_academic_result(
     doi="",
     source="",
     venue="",
+    publication_types=None,
+    citation_count=None,
+    is_open_access=None,
 ):
     """
     Convert academic search results into
@@ -117,6 +130,9 @@ def normalize_academic_result(
 
     if authors is None:
         authors = []
+
+    if publication_types is None:
+        publication_types = []
 
     return {
         "title": title.strip() if title else "",
@@ -146,6 +162,11 @@ def normalize_academic_result(
             if venue
             else ""
         ),
+
+        # Extra fields from Semantic Scholar / OpenAlex
+        "publication_types": publication_types,
+        "citation_count": citation_count,
+        "is_open_access": is_open_access,
     }
 
 
@@ -175,14 +196,8 @@ def remove_duplicates(
 
     for result in results:
 
-        doi = (
-            result.get(
-                "doi",
-                ""
-            )
-            .strip()
-            .lower()
-        )
+        raw_doi = result.get("doi", "") or ""
+        doi = re.sub(r"^(https?://doi\.org/|doi:)", "", raw_doi.strip(), flags=re.IGNORECASE).lower()
 
         url = (
             result.get(
@@ -291,13 +306,13 @@ def metadata_quality_score(result):
 
 def rank_academic_results(results):
     """
-    Rank academic sources by metadata completeness.
+    Preserve the search engine's relevance order (engines return by relevance).
+    Drop records that have no abstract/content — the LLM cannot analyse them —
+    but only if at least one record does have content; otherwise keep all so
+    the caller always gets something back.
     """
-    return sorted(
-        results,
-        key=metadata_quality_score,
-        reverse=True
-    )
+    usable = [r for r in results if r.get("content")]
+    return usable if usable else results
 
 
 # ============================================================
@@ -315,13 +330,8 @@ def search_semantic_scholar(
     controlled retry strategy.
     """
 
-    print(
-        "\n[Academic Search]"
-    )
-
-    print(
-        f'Semantic Scholar query: "{query}"'
-    )
+    logger.info("\n[Academic Search]")
+    logger.info('Semantic Scholar query: "%s"', query)
 
     url = (
         f"{SEMANTIC_SCHOLAR_BASE_URL}"
@@ -340,7 +350,11 @@ def search_semantic_scholar(
             "abstract,"
             "url,"
             "externalIds,"
-            "venue"
+            "venue,"
+            "publicationTypes,"
+            "citationCount,"
+            "openAccessPdf,"
+            "isOpenAccess"
         ),
     }
 
@@ -361,10 +375,9 @@ def search_semantic_scholar(
         SEMANTIC_SCHOLAR_MAX_RETRIES + 1
     ):
 
-        print(
-            f"Semantic Scholar attempt "
-            f"{attempt}/"
-            f"{SEMANTIC_SCHOLAR_MAX_RETRIES}"
+        logger.info(
+            "Semantic Scholar attempt %d/%d",
+            attempt, SEMANTIC_SCHOLAR_MAX_RETRIES
         )
 
         try:
@@ -384,18 +397,13 @@ def search_semantic_scholar(
 
             if response.status_code == 429:
 
-                print(
-                    "Semantic Scholar rate "
-                    "limit reached (429)."
-                )
+                logger.warning("Semantic Scholar rate limit reached (429).")
 
                 if attempt < (
                     SEMANTIC_SCHOLAR_MAX_RETRIES
                 ):
 
-                    print(
-                        "Waiting before retry..."
-                    )
+                    logger.info("Waiting before retry...")
 
                     time.sleep(
                         SEMANTIC_SCHOLAR_RETRY_DELAY_SECONDS
@@ -403,10 +411,7 @@ def search_semantic_scholar(
 
                     continue
 
-                print(
-                    "Semantic Scholar retries "
-                    "exhausted."
-                )
+                logger.warning("Semantic Scholar retries exhausted.")
 
                 return []
 
@@ -418,21 +423,13 @@ def search_semantic_scholar(
 
         except requests.RequestException as error:
 
-            print(
-                "Semantic Scholar failed:"
-            )
-
-            print(
-                error
-            )
+            logger.error("Semantic Scholar request failed: %s", error)
 
             if attempt < (
                 SEMANTIC_SCHOLAR_MAX_RETRIES
             ):
 
-                print(
-                    "Retrying..."
-                )
+                logger.info("Retrying...")
 
                 time.sleep(
                     SEMANTIC_SCHOLAR_RETRY_DELAY_SECONDS
@@ -444,14 +441,7 @@ def search_semantic_scholar(
 
         except ValueError as error:
 
-            print(
-                "Semantic Scholar returned "
-                "invalid JSON:"
-            )
-
-            print(
-                error
-            )
+            logger.error("Semantic Scholar returned invalid JSON: %s", error)
 
             return []
 
@@ -530,6 +520,12 @@ def search_semantic_scholar(
                 source="Semantic Scholar",
 
                 venue=paper.get("venue", "") or "",
+
+                publication_types=paper.get("publicationTypes") or [],
+
+                citation_count=paper.get("citationCount"),
+
+                is_open_access=paper.get("isOpenAccess"),
             )
         )
 
@@ -541,10 +537,7 @@ def search_semantic_scholar(
         results
     )
 
-    print(
-        f"Semantic Scholar returned "
-        f"{len(results)} unique papers."
-    )
+    logger.info("Semantic Scholar returned %d unique papers.", len(results))
 
     return results
 
@@ -561,13 +554,8 @@ def search_crossref(
     Search Crossref as the academic fallback.
     """
 
-    print(
-        "\n[Academic Fallback]"
-    )
-
-    print(
-        f'Crossref query: "{query}"'
-    )
+    logger.info("\n[Academic Fallback]")
+    logger.info('Crossref query: "%s"', query)
 
     params = {
         "query.bibliographic": query,
@@ -613,25 +601,13 @@ def search_crossref(
 
     except requests.RequestException as error:
 
-        print(
-            "Crossref failed:"
-        )
-
-        print(
-            error
-        )
+        logger.error("Crossref request failed: %s", error)
 
         return []
 
     except ValueError as error:
 
-        print(
-            "Crossref returned invalid JSON:"
-        )
-
-        print(
-            error
-        )
+        logger.error("Crossref returned invalid JSON: %s", error)
 
         return []
 
@@ -779,10 +755,127 @@ def search_crossref(
         results
     )
 
-    print(
-        f"Crossref returned "
-        f"{len(results)} unique papers."
-    )
+    logger.info("Crossref returned %d unique papers.", len(results))
+
+    return results
+
+
+# ============================================================
+# OPENALEX
+# ============================================================
+
+def search_openalex(
+    query,
+    max_results=SEMANTIC_SCHOLAR_MAX_RESULTS,
+):
+    """
+    Search OpenAlex for academic works.
+
+    Advantages over Crossref:
+    - Better topical search (not citation-string matching).
+    - Includes is_retracted flag — retracted papers are skipped.
+    - Abstract is reconstructed from the inverted index.
+    - Open-access metadata and venue data are reliable.
+    """
+
+    logger.info("\n[OpenAlex Search]")
+    logger.info('OpenAlex query: "%s"', query)
+
+    mailto = OPENALEX_MAILTO or None
+
+    params = {
+        "search": query,
+        "per-page": max_results,
+        "select": (
+            "id,doi,title,authorships,publication_year,"
+            "abstract_inverted_index,primary_location,"
+            "is_retracted,is_oa,type"
+        ),
+    }
+    if mailto:
+        params["mailto"] = mailto
+
+    try:
+        response = requests.get(
+            f"{OPENALEX_BASE_URL}/works",
+            params=params,
+            timeout=OPENALEX_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    except requests.RequestException as error:
+        logger.error("OpenAlex request failed: %s", error)
+        return []
+
+    except ValueError as error:
+        logger.error("OpenAlex returned invalid JSON: %s", error)
+        return []
+
+    raw_works = data.get("results", [])
+
+    if not raw_works:
+        logger.info("OpenAlex returned zero results.")
+        return []
+
+    results = []
+
+    for work in raw_works:
+
+        # Skip retracted papers
+        if work.get("is_retracted"):
+            logger.debug("Skipping retracted work: %s", work.get("id"))
+            continue
+
+        # Reconstruct abstract from inverted index
+        inv = work.get("abstract_inverted_index") or {}
+        if inv:
+            pos_to_word = {pos: word for word, positions in inv.items() for pos in positions}
+            abstract = " ".join(pos_to_word[i] for i in sorted(pos_to_word))
+        else:
+            abstract = ""
+
+        # Authors
+        authors = [
+            a["author"]["display_name"]
+            for a in work.get("authorships", [])
+            if (a.get("author") or {}).get("display_name")
+        ]
+
+        # DOI — strip the full URL prefix
+        raw_doi = work.get("doi") or ""
+        doi = re.sub(r"^https?://doi\.org/", "", raw_doi, flags=re.IGNORECASE)
+
+        # URL — prefer DOI landing page, fall back to OpenAlex ID page
+        url = raw_doi or work.get("id") or ""
+
+        # Venue
+        primary_loc = work.get("primary_location") or {}
+        src = primary_loc.get("source") or {}
+        venue = src.get("display_name") or ""
+
+        # Publication type
+        pub_type = work.get("type") or ""
+
+        results.append(
+            normalize_academic_result(
+                title=work.get("title") or "",
+                url=url,
+                abstract=abstract,
+                authors=authors,
+                year=work.get("publication_year"),
+                doi=doi,
+                source="OpenAlex",
+                venue=venue,
+                publication_types=[pub_type] if pub_type else [],
+                is_open_access=work.get("is_oa"),
+            )
+        )
+
+    results = remove_duplicates(results)
+    results = rank_academic_results(results)
+
+    logger.info("OpenAlex returned %d unique papers.", len(results))
 
     return results
 
@@ -796,97 +889,106 @@ def academic_search(
     max_results=SEMANTIC_SCHOLAR_MAX_RESULTS,
 ):
     """
-    Academic search pipeline:
+    Academic search pipeline.
 
-        Semantic Scholar
-              ↓
-        controlled retry
-              ↓
-        if failure
-              ↓
-           Crossref
-              ↓
-        normalization
-              ↓
-        deduplication
-              ↓
-        clean academic sources
+    Runs all three providers concurrently, then merges and deduplicates:
+
+        Semantic Scholar  +  OpenAlex  +  Crossref (parallel)
+                              ↓
+                     remove_duplicates (DOI + title)
+                              ↓
+                     rank_academic_results (filter no-abstract, keep order)
+                              ↓
+                     clean academic sources
+
+    Why parallel instead of fallback?
+    - Semantic Scholar has the best abstracts but can rate-limit.
+    - OpenAlex has better topical relevance and skips retractions.
+    - Crossref fills DOI gaps even when abstracts are sparse.
+    Running all three and deduplicating by DOI gives better coverage
+    with no extra wall-clock cost (network I/O is concurrent).
     """
 
     if not query or not query.strip():
-
-        print(
-            "\n[Academic Search]"
-        )
-
-        print(
-            "Empty academic query."
-        )
-
+        logger.warning("[Academic Search] Empty academic query.")
         return []
 
     query = query.strip()
-    
+
     from config import SEARCH_CACHE_ENABLED
+    # Cache key includes a version stamp so stale cached results
+    # (missing OpenAlex data) are not returned after the upgrade.
+    cache_key = f"acad:{_ACAD_CACHE_VERSION}:{query}"
+
     if SEARCH_CACHE_ENABLED:
-        cached = get_cached("acad:" + query, max_results)
+        cached = get_cached(cache_key, max_results)
         if cached is not None:
+            logger.info("[Academic Search] Cache hit for query: %s", query)
             return cached
 
     # ========================================================
-    # PRIMARY
+    # RUN ALL PROVIDERS CONCURRENTLY
     # ========================================================
 
-    results = search_semantic_scholar(
-        query,
-        max_results
-    )
+    import concurrent.futures
 
-    if results:
-        if SEARCH_CACHE_ENABLED:
-            set_cached("acad:" + query, max_results, results)
-        return results
+    provider_results = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(search_semantic_scholar, query, max_results): "Semantic Scholar",
+            executor.submit(search_openalex, query, max_results): "OpenAlex",
+            executor.submit(search_crossref, query, max_results): "Crossref",
+        }
+
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                provider_results[name] = future.result()
+            except Exception as exc:
+                logger.error("[Academic Search] %s raised an exception: %s", name, exc)
+                provider_results[name] = []
+
+    ss_results = provider_results.get("Semantic Scholar", [])
+    oa_results = provider_results.get("OpenAlex", [])
+    cr_results = provider_results.get("Crossref", [])
+
+    if not ss_results:
+        logger.warning(
+            "[Academic Search] Semantic Scholar returned no results (network error or zero results)."
+        )
+    if not oa_results:
+        logger.warning(
+            "[Academic Search] OpenAlex returned no results (network error or zero results)."
+        )
+    if not cr_results:
+        logger.info(
+            "[Academic Search] Crossref returned no results."
+        )
 
     # ========================================================
-    # FALLBACK
+    # MERGE: Semantic Scholar first (best abstracts), then
+    # OpenAlex (topical relevance), then Crossref (DOI coverage)
     # ========================================================
 
-    print(
-        "\n[Academic Search]"
+    combined = ss_results + oa_results + cr_results
+
+    if not combined:
+        logger.error("[Academic Search] All academic search providers returned nothing.")
+        return []
+
+    results = remove_duplicates(combined)
+    results = rank_academic_results(results)
+
+    logger.info(
+        "[Academic Search] Final: %d unique papers from %d+%d+%d raw.",
+        len(results), len(ss_results), len(oa_results), len(cr_results),
     )
 
-    print(
-        "Semantic Scholar returned "
-        "no usable results."
-    )
+    if SEARCH_CACHE_ENABLED:
+        set_cached(cache_key, max_results, results)
 
-    print(
-        "Falling back to Crossref..."
-    )
-
-    results = search_crossref(
-        query,
-        max_results
-    )
-
-    if results:
-        if SEARCH_CACHE_ENABLED:
-            set_cached("acad:" + query, max_results, results)
-        return results
-
-    # ========================================================
-    # COMPLETE FAILURE
-    # ========================================================
-
-    print(
-        "\n[Academic Search]"
-    )
-
-    print(
-        "All academic search providers failed."
-    )
-
-    return []
+    return results
 
 
 # ============================================================

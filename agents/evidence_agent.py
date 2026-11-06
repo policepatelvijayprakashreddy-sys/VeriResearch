@@ -2,6 +2,7 @@ import hashlib
 import logging
 import re
 import sys
+import time
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _stable_source_key(source: dict) -> str:
-    """Create a deterministic key from a source DOI or URL."""
+    """Create a deterministic key from a source DOI, URL, or title."""
     identifier = (
         source.get("doi")
         or source.get("url")
@@ -26,6 +27,9 @@ def _stable_source_key(source: dict) -> str:
         or ""
     )
     identifier = str(identifier).strip().lower().rstrip("/")
+    # Do not assign the same artificial identity to unidentified sources.
+    if not identifier:
+        return ""
     digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
     return f"src_{digest[:16]}"
 
@@ -146,7 +150,33 @@ def _stable_evidence_id(
     return f"ev_{digest[:16]}"
 
 
+class RawEvidenceItem(BaseModel):
+    """Temporary schema for LLM structured output — excludes redundant metadata."""
+
+    source_id: str = Field(
+        description="The exact SOURCE_ID (e.g. source_1, source_2) corresponding to the CONTENT where the quote was taken."
+    )
+
+    evidence: str = Field(
+        description="MUST be an exact verbatim passage or quote copied directly from the source CONTENT. Do not paraphrase."
+    )
+
+    claim: str = Field(
+        description="A concise research claim (at least 6 words) supported by that evidence. Never leave blank."
+    )
+
+
+class RawEvidenceOutput(BaseModel):
+    """Temporary schema for LLM structured batch output."""
+
+    items: List[RawEvidenceItem] = Field(
+        description="Evidence items extracted from the supplied sources."
+    )
+
+
 class EvidenceItem(BaseModel):
+    """Final validated evidence item enriched with authoritative metadata."""
+
     source_id: str = Field(
         description="The source URL or a stable source identifier."
     )
@@ -179,6 +209,8 @@ class EvidenceItem(BaseModel):
 
 
 class EvidenceOutput(BaseModel):
+    """Final collection of validated evidence items."""
+
     items: List[EvidenceItem] = Field(
         description="Evidence items extracted from the supplied sources."
     )
@@ -186,6 +218,7 @@ class EvidenceOutput(BaseModel):
 
 def _extract_batch(topic, batch_with_indices, structured_llm):
     """Extract evidence for a single batch of sources."""
+    preparation_start = time.perf_counter()
     valid_sources = [
         (idx, s) for idx, s in batch_with_indices
         if (s.get("content") or "").strip()
@@ -218,26 +251,40 @@ Extract only evidence directly supported by the source content.
 For each useful source, provide:
 
 - source_id: MUST strictly be the exact SOURCE_ID (e.g. source_1, source_2) corresponding to the CONTENT where the quote was taken.
-- source_title: the source title
-- source_url: the exact source URL
 - evidence: MUST be an exact quote or verbatim passage copied directly from CONTENT. Do not paraphrase or use titles as evidence.
 - claim: a concise research claim (at least 6 words) supported by that evidence. Never leave blank.
 - For TYPE: ACADEMIC PAPER, return up to 3 separate items (repeat the same source_id) covering that paper's most important findings, results or conclusions. Each item needs its own verbatim quote and claim.
 - For TYPE: WEB PAGE, return at most 1 item.
 
-Do not create or modify URLs.
 Do not invent facts, sources, authors, dates, statistics, or conclusions.
 Do not include evidence that is not present in the supplied source content.
 """
+    preparation_elapsed = time.perf_counter() - preparation_start
+    logger.info(
+        "[Evidence Agent] Prompt preparation: %d sources | %.2f seconds",
+        len(valid_sources),
+        preparation_elapsed,
+    )
 
     source_lookup = {
         f"source_{idx}": source
         for idx, source in valid_sources
     }
     try:
+        llm_start = time.perf_counter()
         response = structured_llm.invoke(prompt)
+        llm_elapsed = time.perf_counter() - llm_start
+        logger.info(
+            "[Evidence Agent] LLM extraction: %d sources | %d prompt characters | %.2f seconds",
+            len(valid_sources),
+            len(prompt),
+            llm_elapsed,
+        )
+
         if not response or not hasattr(response, "items"):
             return []
+
+        validation_start = time.perf_counter()
 
         validated_items = []
         for item in response.items:
@@ -300,6 +347,15 @@ Do not include evidence that is not present in the supplied source content.
                     evidence_id=evidence_id,
                 )
             )
+
+        validation_elapsed = time.perf_counter() - validation_start
+        logger.info(
+            "[Evidence Agent] Validation: %d extracted | %d accepted | %.2f seconds",
+            len(response.items),
+            len(validated_items),
+            validation_elapsed,
+        )
+
         return validated_items
     except Exception as error:
         logger.error(
@@ -315,7 +371,7 @@ def extract_evidence(topic, sources, batch_size=5):
         return EvidenceOutput(items=[])
 
     llm = create_llm()
-    structured_llm = llm.with_structured_output(EvidenceOutput)
+    structured_llm = llm.with_structured_output(RawEvidenceOutput)
 
     all_items = []
     # Process sources in chunks so later sources (e.g. academic literature) don't get starved
