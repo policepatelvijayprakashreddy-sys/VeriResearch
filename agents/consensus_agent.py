@@ -20,6 +20,9 @@ Core Optimizations & Safeguards:
      along with source citations.
 """
 
+from __future__ import annotations
+
+from functools import lru_cache
 import logging
 import re
 import sys
@@ -30,7 +33,15 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
-from agents.verification_agent import _load_nli_pipeline, _verify_one, ENTAILMENT, CONTRADICTION, NEUTRAL
+from agents.verification_agent import (
+    _load_nli_pipeline,
+    _verify_one,
+    _verify_batch,
+    _cached_batch,
+    ENTAILMENT,
+    CONTRADICTION,
+    NEUTRAL,
+)
 from agents.evidence_agent import _stable_source_key, _stable_evidence_id
 
 logger = logging.getLogger(__name__)
@@ -49,26 +60,44 @@ STOP_WORDS = {
 # SOURCE NORMALIZATION FOR DEDUPLICATION
 # ============================================================
 
-def _normalize_identifier(source: dict) -> str:
-    """Normalize DOI, URL, or title into a canonical source identifier for deduplication."""
+def _normalize_identifier(source: dict) -> str | None:
+    """Normalize DOI, URL, or title into a canonical source identifier."""
     doi = (source.get("doi") or "").strip().lower()
     if not doi:
-        url_raw = (source.get("url") or source.get("source_url") or "").strip()
-        doi_match = re.search(r"doi\.org/(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", url_raw, re.IGNORECASE)
+        url_raw = (
+            source.get("url")
+            or source.get("source_url")
+            or ""
+        ).strip()
+        doi_match = re.search(
+            r"doi\.org/(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)",
+            url_raw,
+            re.IGNORECASE,
+        )
         if doi_match:
             doi = doi_match.group(1).lower()
-
     if doi:
-        doi = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", doi).strip().rstrip("/")
+        doi = re.sub(
+            r"^(https?://(dx\.)?doi\.org/|doi:\s*)",
+            "",
+            doi,
+        ).strip().rstrip("/")
         if doi:
             return f"doi:{doi}"
-
-    url = (source.get("url") or source.get("source_url") or "").strip().lower().rstrip("/")
+    url = (
+        source.get("url")
+        or source.get("source_url")
+        or ""
+    ).strip().lower().rstrip("/")
     if url:
         return f"url:{url}"
-    title = (source.get("title") or source.get("source_title") or "").strip().lower()
+    title = (
+        source.get("title")
+        or source.get("source_title")
+        or ""
+    ).strip().lower()
     clean_title = " ".join(re.findall(r"\w+", title))
-    return f"title:{clean_title}"
+    return f"title:{clean_title}" if clean_title else None
 
 
 # ============================================================
@@ -92,6 +121,274 @@ def _lexical_prefilter(claim_keywords: set, text: str, min_overlap: int = 2) -> 
     overlap = len(claim_keywords & text_words)
     required = min(min_overlap, len(claim_keywords))
     return overlap >= required
+
+
+# ============================================================
+# BM25 & SENTENCE-WINDOW PASSAGE RETRIEVAL
+# ============================================================
+
+import math
+
+class BM25Okapi:
+    """
+    Robust non-negative BM25 implementation for sentence windows.
+    Uses Lucene-style non-negative IDF (log(1 + (N - n + 0.5)/(n + 0.5)))
+    so overlapping windows and small passage sets do not suffer from negative IDFs.
+    """
+    def __init__(self, corpus: list, k1: float = 1.5, b: float = 0.75):
+        self.corpus_size = len(corpus)
+        self.avgdl = sum(len(x) for x in corpus) / (self.corpus_size or 1)
+        self.corpus = corpus
+        self.k1 = k1
+        self.b = b
+        self.doc_len = [len(x) for x in corpus]
+        df = {}
+        for doc in corpus:
+            for word in set(doc):
+                df[word] = df.get(word, 0) + 1
+        self.idf = {
+            word: math.log((self.corpus_size - freq + 0.5) / (freq + 0.5) + 1.0)
+            for word, freq in df.items()
+        }
+
+    def get_scores(self, query: list) -> list:
+        scores = [0.0] * self.corpus_size
+        for q in query:
+            if q not in self.idf:
+                continue
+            q_idf = self.idf[q]
+            for i, doc in enumerate(self.corpus):
+                freq = doc.count(q)
+                if freq <= 0:
+                    continue
+                denom = freq + self.k1 * (1.0 - self.b + self.b * self.doc_len[i] / (self.avgdl or 1.0))
+                scores[i] += q_idf * (freq * (self.k1 + 1.0)) / (denom or 1.0)
+        return scores
+
+
+def _windows(text: str, size: int = 2) -> list[str]:
+    """
+    Split text into overlapping sentence windows while protecting
+    common academic abbreviations from incorrect sentence splitting.
+    """
+    if not text or not text.strip():
+        return []
+    if size < 1:
+        raise ValueError("Window size must be at least 1")
+
+    # Protect common academic abbreviations before sentence splitting.
+    abbreviation_pattern = re.compile(
+        r"\b(?:e\.g|i\.e|figs?|eqs?|refs?)\.",
+        re.IGNORECASE,
+    )
+    placeholder = "\uE000"
+    protected_text = abbreviation_pattern.sub(
+        lambda match: match.group().replace(".", placeholder),
+        text.strip(),
+    )
+
+    # Split only on actual sentence-ending punctuation.
+    sentences = [
+        sentence.strip().replace(placeholder, ".")
+        for sentence in re.split(r"(?<=[.!?])\s+", protected_text)
+        if sentence.strip()
+    ]
+    if not sentences:
+        return []
+    if len(sentences) <= size:
+        return [" ".join(sentences)]
+    return [" ".join(sentences[i : i + size]) for i in range(len(sentences) - size + 1)]
+
+
+def _find_best_passage_bm25(
+    claim: str,
+    content: str,
+    max_chars: int = 500,
+    size: int = 2,
+) -> tuple[str, float]:
+    """
+    Split content into small 2-sentence sliding windows and retrieve the top window using BM25.
+    Returns (best_passage, bm25_score).
+    """
+    if not content or not content.strip():
+        return "", 0.0
+
+    windows = _windows(content, size=size)
+    if not windows:
+        return "", 0.0
+
+    claim_words = _extract_claim_keywords(claim)
+
+    tokenized_windows = [re.findall(r"\b[a-zA-Z0-9]{2,}\b", w.lower()) for w in windows]
+    tokenized_claim = [w for w in re.findall(r"\b[a-zA-Z0-9]{2,}\b", claim.lower()) if w not in STOP_WORDS]
+    if not tokenized_claim:
+        tokenized_claim = re.findall(r"\b[a-zA-Z0-9]{2,}\b", claim.lower())
+
+    try:
+        bm25 = BM25Okapi(tokenized_windows)
+        scores = bm25.get_scores(tokenized_claim)
+        best_idx = max(range(len(windows)), key=lambda i: scores[i])
+        best_score = float(scores[best_idx])
+        overlap = len(set(tokenized_claim) & set(tokenized_windows[best_idx]))
+        if overlap == 0 or best_score <= 0.0:
+            return "", 0.0
+        best_win = windows[best_idx]
+        if len(best_win) > max_chars:
+            best_win = best_win[:max_chars] + "..."
+        return best_win, best_score
+    except Exception as e:
+        logger.debug(
+            "[Consensus Agent] BM25 window ranking fallback: %s",
+            e,
+        )
+        fallback = _find_best_passage(
+            claim_words,
+            content,
+            max_chars,
+        )
+        if not fallback or not claim_words:
+            return "", 0.0
+        fallback_words = set(
+            re.findall(r"\b[a-zA-Z]{3,}\b", fallback.lower())
+        )
+        overlap = len(claim_words & fallback_words)
+        if overlap == 0:
+            return "", 0.0
+        return fallback, float(overlap)
+
+
+# ============================================================
+# SEMANTIC PASSAGE RETRIEVAL
+# ============================================================
+
+@lru_cache(maxsize=2)
+def _load_semantic_model(model_name: str):
+    """
+    Lazily load and cache the sentence-transformer model.
+    Uses CPU to remain compatible with the current environment.
+    """
+    from sentence_transformers import SentenceTransformer
+    logger.info(
+        "[Consensus Agent] Loading semantic model: %s",
+        model_name,
+    )
+    try:
+        return SentenceTransformer(model_name, device="cpu", local_files_only=True)
+    except Exception:
+        return SentenceTransformer(model_name, device="cpu")
+
+
+@lru_cache(maxsize=4096)
+def _encode_semantic_text(text: str, model_name: str) -> tuple:
+    """
+    Encode and cache an individual text as a normalized embedding.
+    Tuples make cached embeddings immutable and safe to reuse.
+    """
+    model = _load_semantic_model(model_name)
+    embedding = model.encode(
+        text,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    return tuple(float(value) for value in embedding)
+
+
+def _find_best_passage_semantic(
+    claim: str,
+    content: str,
+    max_chars: int = 500,
+    size: int = 2,
+) -> tuple[str, float]:
+    """
+    Retrieve the most semantically similar content window.
+    Similarity is used only for candidate retrieval.
+    NLI determines whether evidence supports or contradicts a claim.
+    """
+    if not claim or not content or not content.strip():
+        return "", 0.0
+
+    windows = _windows(content, size=size)
+    if not windows:
+        return "", 0.0
+
+    try:
+        model_name = config.SEMANTIC_MODEL_NAME
+        claim_embedding = _encode_semantic_text(
+            claim,
+            model_name,
+        )
+        ranked = []
+        for window in windows:
+            passage_embedding = _encode_semantic_text(
+                window,
+                model_name,
+            )
+            similarity = sum(
+                a * b
+                for a, b in zip(
+                    claim_embedding,
+                    passage_embedding,
+                )
+            )
+            ranked.append((window, float(similarity)))
+
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        top_k = max(1, int(config.SEMANTIC_TOP_K))
+        best_candidates = ranked[:top_k]
+        best_passage, best_score = best_candidates[0]
+
+        if best_score < config.SEMANTIC_SIMILARITY_THRESHOLD:
+            return "", best_score
+
+        if len(best_passage) > max_chars:
+            best_passage = best_passage[:max_chars] + "..."
+        return best_passage, best_score
+    except Exception:
+        logger.exception(
+            "[Consensus Agent] Semantic retrieval failed."
+        )
+        return "", 0.0
+
+
+def _retrieve_candidate_passage(
+    claim: str,
+    content: str,
+    claim_keywords: set,
+    discovery_text: str = "",
+) -> tuple[str, float, str]:
+    """
+    Try BM25 first, then semantic retrieval.
+    Returns:
+        (passage, score, retrieval_method)
+    """
+    if not content or not content.strip():
+        return "", 0.0, "none"
+
+    lexical_match = _lexical_prefilter(
+        claim_keywords,
+        discovery_text or content,
+        min_overlap=2,
+    )
+    if lexical_match:
+        passage, score = _find_best_passage_bm25(
+            claim,
+            content,
+        )
+        if passage and score > 0.0:
+            return passage, score, "bm25"
+
+    if not getattr(config, "ENABLE_SEMANTIC_RETRIEVAL", False):
+        return "", 0.0, "none"
+
+    passage, score = _find_best_passage_semantic(
+        claim,
+        content,
+    )
+    if passage and score > 0.0:
+        return passage, score, "semantic"
+
+    return "", 0.0, "none"
 
 
 def _find_best_passage(claim_keywords: set, content: str, max_chars: int = 500) -> str:
@@ -283,7 +580,12 @@ def evaluate_claim_consensus(
     origin_retracted = claim_item.get("is_retracted", False)
     if not origin_retracted:
         for s in literature_sources:
-            if _normalize_identifier(s) == origin_canonical_id:
+            source_canonical_id = _normalize_identifier(s)
+            if (
+                origin_canonical_id
+                and source_canonical_id
+                and source_canonical_id == origin_canonical_id
+            ):
                 if s.get("is_retracted"):
                     origin_retracted = True
                     break
@@ -317,6 +619,7 @@ def evaluate_claim_consensus(
 
     # Track independent sources already evaluated to prevent duplicate counting
     seen_independent_sources = set()
+    candidates_to_evaluate = []
 
     # Evaluate across independent literature sources
     for source in literature_sources:
@@ -329,13 +632,20 @@ def evaluate_claim_consensus(
         s_retracted = source.get("is_retracted", False)
 
         # Skip if this is the originating source
-        if s_canonical_id == origin_canonical_id or (origin_source_key and s_source_key == origin_source_key):
+        if (
+            (s_canonical_id and origin_canonical_id == s_canonical_id)
+            or (origin_source_key and s_source_key == origin_source_key)
+        ):
             continue
 
         # Deduplicate independent sources (e.g. duplicate DOI or URL records)
-        if s_canonical_id in seen_independent_sources or (s_source_key and s_source_key in seen_independent_sources):
+        if (
+            (s_canonical_id and s_canonical_id in seen_independent_sources)
+            or (s_source_key and s_source_key in seen_independent_sources)
+        ):
             continue
-        seen_independent_sources.add(s_canonical_id)
+        if s_canonical_id:
+            seen_independent_sources.add(s_canonical_id)
         if s_source_key:
             seen_independent_sources.add(s_source_key)
 
@@ -344,17 +654,24 @@ def evaluate_claim_consensus(
             unaddressed.append(s_title)
             continue
 
-        # 1. Lexical Pre-Filter: Does discovery text (title + content) mention relevant concepts?
         discovery_text = f"{s_title}. {s_content}"
-        if not _lexical_prefilter(claim_keywords, discovery_text, min_overlap=2):
-            unaddressed.append(s_title)
-            continue
-
-        # 2. Extract best focused candidate passage STRICTLY from source content (never from title alone)
-        candidate_passage = _find_best_passage(claim_keywords, s_content)
+        candidate_passage, retrieval_score, retrieval_method = (
+            _retrieve_candidate_passage(
+                claim,
+                s_content,
+                claim_keywords,
+                discovery_text,
+            )
+        )
         if not candidate_passage or not candidate_passage.strip():
             unaddressed.append(s_title)
             continue
+        logger.debug(
+            "[Consensus Agent] Retrieved candidate using %s (score=%.4f): %s",
+            retrieval_method,
+            retrieval_score,
+            s_title,
+        )
 
         s_evidence_id = _stable_evidence_id(s_source_key, candidate_passage, claim)
 
@@ -373,38 +690,51 @@ def evaluate_claim_consensus(
             logger.warning("[Consensus Alert] Retracted paper found in claim audit: %s", s_title)
             continue
 
-        # 4. DeBERTa NLI Inference
-        if pipe is not None:
-            label, conf = _verify_one(claim, candidate_passage, pipe, threshold)
-        else:
-            label, conf = NEUTRAL, None
+        candidates_to_evaluate.append({
+            "source": source,
+            "title": s_title,
+            "url": s_url,
+            "venue": s_venue,
+            "passage": candidate_passage,
+            "source_key": s_source_key,
+            "evidence_id": s_evidence_id,
+        })
 
-        if label == ENTAILMENT:
-            supporting.append({
-                "title": s_title,
-                "url": s_url,
-                "venue": s_venue,
-                "evidence": candidate_passage,
-                "confidence": round(conf, 3) if conf is not None else None,
-                "is_origin": False,
-                "source_key": s_source_key,
-                "evidence_id": s_evidence_id,
-                "source_id": source.get("source_id", ""),
-            })
-        elif label == CONTRADICTION:
-            contradicting.append({
-                "title": s_title,
-                "url": s_url,
-                "venue": s_venue,
-                "evidence": candidate_passage,
-                "confidence": round(conf, 3) if conf is not None else None,
-                "is_origin": False,
-                "source_key": s_source_key,
-                "evidence_id": s_evidence_id,
-                "source_id": source.get("source_id", ""),
-            })
+    # 4. DeBERTa NLI Inference in Batch (using disk cache)
+    if candidates_to_evaluate:
+        if pipe is not None:
+            pairs = [(claim, c["passage"]) for c in candidates_to_evaluate]
+            verdicts = _cached_batch(pairs, pipe, threshold)
         else:
-            unaddressed.append(s_title)
+            verdicts = [(NEUTRAL, None)] * len(candidates_to_evaluate)
+
+        for c, (label, conf) in zip(candidates_to_evaluate, verdicts):
+            if label == ENTAILMENT:
+                supporting.append({
+                    "title": c["title"],
+                    "url": c["url"],
+                    "venue": c["venue"],
+                    "evidence": c["passage"],
+                    "confidence": round(conf, 3) if conf is not None else None,
+                    "is_origin": False,
+                    "source_key": c["source_key"],
+                    "evidence_id": c["evidence_id"],
+                    "source_id": c["source"].get("source_id", ""),
+                })
+            elif label == CONTRADICTION:
+                contradicting.append({
+                    "title": c["title"],
+                    "url": c["url"],
+                    "venue": c["venue"],
+                    "evidence": c["passage"],
+                    "confidence": round(conf, 3) if conf is not None else None,
+                    "is_origin": False,
+                    "source_key": c["source_key"],
+                    "evidence_id": c["evidence_id"],
+                    "source_id": c["source"].get("source_id", ""),
+                })
+            else:
+                unaddressed.append(c["title"])
 
     # 5. Synthesize Consensus Verdict distinguishing originating support from independent corroboration
     num_origin_sup = len([s for s in supporting if s.get("is_origin", False)])
@@ -594,6 +924,62 @@ def consensus_agent(
 
     if pipe is None and config.ENABLE_VERIFICATION:
         pipe = _load_nli_pipeline()
+
+    # Pre-warm disk cache by running all candidate pairs across core claims in a single unified batch
+    if pipe is not None and config.ENABLE_VERIFICATION:
+        all_candidate_pairs = []
+        for item in core_claims:
+            c_claim = (item.get("claim") or "").strip()
+            c_keywords = _extract_claim_keywords(c_claim)
+            c_origin_id = _normalize_identifier(item)
+            c_origin_key = item.get("source_key") or _stable_source_key(item)
+            c_seen = set()
+
+            for s in literature_sources:
+                s_id = _normalize_identifier(s)
+                s_key = s.get("source_key") or _stable_source_key(s)
+                if (
+                    (s_id and c_origin_id and s_id == c_origin_id)
+                    or (c_origin_key and s_key == c_origin_key)
+                ):
+                    continue
+                if (
+                    (s_id and s_id in c_seen)
+                    or (s_key and s_key in c_seen)
+                ):
+                    continue
+                if s_id:
+                    c_seen.add(s_id)
+                if s_key:
+                    c_seen.add(s_key)
+
+                content = (s.get("content") or s.get("snippet") or "").strip()
+                if not content:
+                    continue
+                discovery_text = f"{s.get('title', '')}. {content}"
+                passage, score, retrieval_method = (
+                    _retrieve_candidate_passage(
+                        c_claim,
+                        content,
+                        c_keywords,
+                        discovery_text,
+                    )
+                )
+                if passage and passage.strip():
+                    all_candidate_pairs.append((c_claim, passage))
+                    logger.debug(
+                        "[Consensus Agent] Cache prewarming candidate via %s "
+                        "(score=%.4f)",
+                        retrieval_method,
+                        score,
+                    )
+
+        if all_candidate_pairs:
+            logger.info(
+                "[Consensus Agent] Running batched NLI across %d candidate pairs for %d claims...",
+                len(all_candidate_pairs), len(core_claims)
+            )
+            _cached_batch(all_candidate_pairs, pipe, config.NLI_CONFIDENCE_THRESHOLD)
 
     profiles = []
     for item in core_claims:

@@ -110,6 +110,21 @@ NLI_MODEL_NAME = "cross-encoder/nli-deberta-v3-small"
 # Minimum confidence to trust an NLI label (0.0-1.0)
 NLI_CONFIDENCE_THRESHOLD = 0.70
 
+# NLI Disk Cache Directory
+NLI_CACHE_DIR = os.path.join(
+    os.path.dirname(__file__), "data", "nli_cache"
+)
+
+# ============================================
+# SEMANTIC RETRIEVAL (CONSENSUS)
+# ============================================
+
+# Semantic retrieval configuration
+ENABLE_SEMANTIC_RETRIEVAL = True
+SEMANTIC_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+SEMANTIC_SIMILARITY_THRESHOLD = 0.40
+SEMANTIC_TOP_K = 3
+
 # ============================================
 # SOURCE DIVERSITY TARGETS
 # ============================================
@@ -151,6 +166,19 @@ QUALITY_CACHE_DIR = os.path.join(
     os.path.dirname(__file__), "data", "quality_cache"
 )
 QUALITY_CACHE_TTL_HOURS = int(os.getenv("QUALITY_CACHE_TTL_HOURS", "168"))  # 7 days
+
+# ============================================
+# SOURCE TRUST TIERS
+# ============================================
+
+# Tier 1 = peer-reviewed / institutional domains (highest trust)
+# Tier 2 = everything else (accepted by default)
+#
+# When STRICT_SOURCES = True, tier-2 sources are dropped from search
+# results.  Set to False (the default) to rank by trust but keep all
+# sources; set to True for high-stakes research where you want only
+# verified academic / institutional URLs.
+STRICT_SOURCES = os.getenv("STRICT_SOURCES", "false").lower() == "true"
 
 # ============================================
 # OPEN-ACCESS FULL-TEXT & PDF EXTRACTION
